@@ -511,6 +511,10 @@ export interface ImageBuildRecord {
 	extraHosts?: string[];
 	push: boolean;
 	load: boolean;
+	sourceUpdateMode?: 'none' | 'git-pull';
+	sourceRevision?: string;
+	sourceBranch?: string;
+	sourceRepository?: string;
 	digest?: string;
 	errorMessage?: string;
 	output?: string;

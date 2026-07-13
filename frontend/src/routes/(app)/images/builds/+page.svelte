@@ -189,13 +189,14 @@
 	const buildHistoryItems = $derived<Paginated<ImageBuildRecord>>(buildHistoryQuery.data ?? EMPTY_BUILD_HISTORY);
 	const resolvedProvider = $derived(depotAvailable ? $inputs.provider.value : 'local');
 	const isPushMode = $derived(resolvedProvider === 'depot' ? true : $inputs.push.value);
+	const showRegistrySelection = $derived(isPushMode || (contextMode === 'workspace' && resolvedProvider === 'local'));
 
 	const registriesQuery = createQuery(() => ({
 		queryKey: queryKeys.containerRegistries.list({
 			pagination: { page: 1, limit: 100 },
 			sort: { column: 'url', direction: 'asc' }
 		}),
-		enabled: isPushMode,
+		enabled: isPushMode || contextMode === 'workspace',
 		queryFn: () =>
 			containerRegistryService.getRegistries({
 				pagination: { page: 1, limit: 100 },
@@ -221,6 +222,20 @@
 	const selectedRegistry = $derived((registriesQuery.data?.data ?? []).find((r) => r.id === $inputs.registryId.value));
 
 	const repositoryOptions = $derived((selectedRegistry?.repositoryNames ?? []).map((name) => ({ label: name, value: name })));
+	const sourceImageName = $derived(
+		buildContextDisplayName(workspaceContextDir)
+			.toLowerCase()
+			.replace(/[^a-z0-9._-]+/g, '-')
+			.replace(/^[-._]+|[-._]+$/g, '')
+	);
+	const canGitBuild = $derived(
+		contextMode === 'workspace' &&
+			selectedContextPath !== '/' &&
+			resolvedProvider === 'local' &&
+			!!selectedRegistry?.enabled &&
+			repositoryOptions.some((option) => option.value === $inputs.repositoryName.value) &&
+			!isBuilding
+	);
 
 	function normalizeRegistryHost(url: string): string {
 		return url.replace(/^https?:\/\//, '').replace(/\/+$/, '');
@@ -242,6 +257,16 @@
 		if (current !== lastRegistryId) {
 			lastRegistryId = current;
 			$inputs.repositoryName.value = '';
+		}
+	});
+
+	$effect(() => {
+		if (
+			!$inputs.repositoryName.value &&
+			sourceImageName &&
+			repositoryOptions.some((option) => option.value === sourceImageName)
+		) {
+			$inputs.repositoryName.value = sourceImageName;
 		}
 	});
 
@@ -828,7 +853,7 @@
 		buildHistoryDetailsOpen = false;
 	}
 
-	async function handleSubmit() {
+	async function handleSubmit(sourceUpdateMode: 'none' | 'git-pull' = 'none') {
 		const data = form.validate();
 		if (!data) return;
 
@@ -845,12 +870,21 @@
 		buildStatusText = m.starting_build();
 		appendLog(m.using_context({ context: contextDir }));
 
-		const resolvedProvider = depotAvailable ? data.provider : 'local';
-		const push = resolvedProvider === 'depot' ? true : data.push;
+		const isGitSourceBuild = sourceUpdateMode === 'git-pull';
+		const resolvedProvider = isGitSourceBuild ? 'local' : depotAvailable ? data.provider : 'local';
+		const push = isGitSourceBuild || resolvedProvider === 'depot' ? true : data.push;
 		const load = resolvedProvider === 'depot' ? false : data.load;
 
 		let tags: string[];
-		if (push) {
+		if (isGitSourceBuild) {
+			const reg = (registriesQuery.data?.data ?? []).find((r) => r.id === data.registryId && r.enabled);
+			if (!reg || !reg.repositoryNames?.includes(data.repositoryName.trim())) {
+				toast.error(m.build_git_registry_required());
+				isBuilding = false;
+				return;
+			}
+			tags = [];
+		} else if (push) {
 			const reg = (registriesQuery.data?.data ?? []).find((r) => r.id === data.registryId);
 			if (!reg) {
 				toast.error(m.build_push_registry_required());
@@ -928,7 +962,10 @@
 			platforms: parsedPlatforms,
 			provider: resolvedProvider,
 			push,
-			load
+			load,
+			sourceUpdateMode,
+			registryId: isGitSourceBuild ? data.registryId : undefined,
+			repositoryName: isGitSourceBuild ? data.repositoryName.trim() : undefined
 		};
 
 		try {
@@ -1145,6 +1182,14 @@
 										{buildHistorySelected.tags?.join(', ') || '-'}
 									</div>
 								</div>
+								{#if buildHistorySelected.sourceRevision}
+									<div class="border-border/60 rounded-lg border bg-zinc-950/40 p-3">
+										<div class="text-muted-foreground text-[10px] font-semibold tracking-[0.12em] uppercase">
+											{m.build_source_revision()}
+										</div>
+										<div class="mt-2 font-mono text-xs break-all">{buildHistorySelected.sourceRevision}</div>
+									</div>
+								{/if}
 								<div class="border-border/60 rounded-lg border bg-zinc-950/40 p-3">
 									<div class="text-muted-foreground text-[10px] font-semibold tracking-[0.12em] uppercase">
 										{m.dockerfile()}
@@ -1380,7 +1425,14 @@
 				</Tabs.List>
 
 				<div class="flex items-center gap-3 pr-2">
-					<BuildControls {inputs} {providerOptions} {isBuilding} onBuild={handleSubmit} />
+					<BuildControls
+						{inputs}
+						{providerOptions}
+						{isBuilding}
+						{canGitBuild}
+						onBuild={() => handleSubmit()}
+						onGitBuild={() => handleSubmit('git-pull')}
+					/>
 					<div class="bg-border hidden h-4 w-px xl:block"></div>
 					<div class="flex items-center gap-2">
 						<div class="relative flex items-center">
@@ -1410,6 +1462,7 @@
 					provider={$inputs.provider.value}
 					bind:showAdvanced
 					{isPushMode}
+					{showRegistrySelection}
 					{registryOptions}
 					{repositoryOptions}
 					{fullImageReference}
@@ -1502,7 +1555,14 @@
 
 		{#snippet headerActions()}
 			{#if mainTab === 'build'}
-				<BuildControls {inputs} {providerOptions} {isBuilding} onBuild={handleSubmit} />
+				<BuildControls
+					{inputs}
+					{providerOptions}
+					{isBuilding}
+					{canGitBuild}
+					onBuild={() => handleSubmit()}
+					onGitBuild={() => handleSubmit('git-pull')}
+				/>
 			{/if}
 		{/snippet}
 
@@ -1522,7 +1582,14 @@
 							</div>
 						{/snippet}
 						{#snippet headerActions()}
-							<BuildControls {inputs} {providerOptions} {isBuilding} onBuild={handleSubmit} />
+							<BuildControls
+								{inputs}
+								{providerOptions}
+								{isBuilding}
+								{canGitBuild}
+								onBuild={() => handleSubmit()}
+								onGitBuild={() => handleSubmit('git-pull')}
+							/>
 						{/snippet}
 						{#snippet tabContent(buildTabValue)}
 							{#if buildTabValue === 'workspace'}
@@ -1534,8 +1601,9 @@
 										provider={$inputs.provider.value}
 										bind:showAdvanced
 										{isPushMode}
+										{showRegistrySelection}
 										{registryOptions}
-									{repositoryOptions}
+										{repositoryOptions}
 										{fullImageReference}
 										registryLoadError={registriesQuery.error as { message?: string } | null}
 										onSubmit={handleSubmit}

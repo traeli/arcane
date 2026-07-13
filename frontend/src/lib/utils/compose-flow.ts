@@ -4,7 +4,7 @@ import { templateService } from '$lib/services/template-service.js';
 import type { Template } from '$lib/types/swarm';
 import { handleApiResultWithCallbacks, tryCatch } from '$lib/utils/api';
 import { toast } from 'svelte-sonner';
-import { parseDocument } from 'yaml';
+import { isMap, parseDocument, YAMLMap } from 'yaml';
 import { z } from 'zod/v4';
 
 export type ConvertedDockerRun = {
@@ -82,6 +82,44 @@ export function extractComposeYamlName(content: string): string | null {
 	} catch {
 		return null;
 	}
+}
+
+export function getComposeServiceNames(content: string): string[] {
+	if (!content.trim()) return [];
+	const doc = parseDocument(content);
+	if (doc.errors.length > 0) return [];
+	const services = doc.get('services', true);
+	if (!isMap(services)) return [];
+	return services.items.map((item) => String(item.key ?? '').trim()).filter(Boolean);
+}
+
+export function applyImageToComposeService(content: string, serviceName: string, imageReference: string): string {
+	const normalizedService = serviceName.trim();
+	const normalizedImage = imageReference.trim();
+	if (!normalizedService || !normalizedImage) return content;
+
+	const source = content.trim() ? content : 'services: {}\n';
+	const doc = parseDocument(source);
+	if (doc.errors.length > 0) {
+		throw new Error(doc.errors[0]?.message ?? 'Invalid Compose YAML');
+	}
+	if (!doc.has('services')) doc.set('services', new YAMLMap());
+	const services = doc.get('services', true);
+	if (!isMap(services)) throw new Error('Compose services must be a mapping');
+	services.flow = false;
+	const serviceExists = doc.hasIn(['services', normalizedService]);
+	doc.setIn(['services', normalizedService, 'image'], normalizedImage);
+	const service = doc.getIn(['services', normalizedService], true);
+	if (isMap(service)) service.flow = false;
+	if (!serviceExists) doc.setIn(['services', normalizedService, 'restart'], 'unless-stopped');
+	return String(doc);
+}
+
+export function imageReferenceServiceName(imageReference: string): string {
+	const withoutDigest = imageReference.split('@', 1)[0] ?? imageReference;
+	const lastSegment = withoutDigest.split('/').pop() ?? withoutDigest;
+	const withoutTag = lastSegment.replace(/:[^:]+$/, '');
+	return templateNameSlug(withoutTag) || 'app';
 }
 
 export function createComposeEditorSchema(nameRequiredMessage: string) {

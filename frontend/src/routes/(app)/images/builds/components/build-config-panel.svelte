@@ -14,6 +14,7 @@
 		provider,
 		showAdvanced = $bindable(false),
 		isPushMode = false,
+		showRegistrySelection = false,
 		registryOptions = [],
 		repositoryOptions = [],
 		fullImageReference = '',
@@ -24,6 +25,7 @@
 		provider: 'local' | 'depot';
 		showAdvanced?: boolean;
 		isPushMode?: boolean;
+		showRegistrySelection?: boolean;
 		registryOptions?: RegistryOption[];
 		repositoryOptions?: RegistryOption[];
 		fullImageReference?: string;
@@ -38,7 +40,7 @@
 <div class="space-y-7 p-8">
 	<form onsubmit={preventDefault(() => onSubmit?.())} class="space-y-7">
 		<div class="space-y-4">
-			{#if isPushMode}
+			{#if showRegistrySelection}
 				<SelectWithLabel
 					id="build-push-registry"
 					label={m.build_push_registry_label()}
@@ -64,7 +66,9 @@
 				{#if $inputs.registryId.value && repositoryOptions.length === 0 && !registryLoadError}
 					<p class="text-muted-foreground text-xs">{m.build_push_repository_empty()}</p>
 				{/if}
+			{/if}
 
+			{#if isPushMode}
 				<FormInput
 					label={m.build_push_tag_label()}
 					type="text"

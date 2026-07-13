@@ -39,6 +39,7 @@
 	import { toSafeHref } from '$lib/utils/navigation';
 	import { PersistedState } from 'runed';
 	import ComposeFileEditorPanel from '$lib/components/compose-file-editor-panel.svelte';
+	import ImageReferenceSelector from '$lib/components/compose/image-reference-selector.svelte';
 	import EditableName from '../components/EditableName.svelte';
 	import ProjectFileTreePanel from '../components/ProjectFileTreePanel.svelte';
 	import EditorTabStrip from '../components/EditorTabStrip.svelte';
@@ -1517,6 +1518,12 @@
 							</div>
 						</Alert.Root>
 					{/if}
+					<div class="mb-4 shrink-0">
+						<ImageReferenceSelector
+							bind:composeContent={$inputs.composeContent.value}
+							disabled={isGitOpsManaged || !canUpdateProject || isLoading.saving}
+						/>
+					</div>
 					<div class="mb-2 flex shrink-0 items-center justify-end gap-2">
 						<label
 							for="layout-mode-toggle"

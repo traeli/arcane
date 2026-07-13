@@ -16,6 +16,7 @@
 	import { environmentStore } from '$lib/stores/environment.store.svelte';
 	import { hasPermission } from '$lib/utils/auth';
 	import { ComposeEditorSplit } from '$lib/components/compose';
+	import ImageReferenceSelector from '$lib/components/compose/image-reference-selector.svelte';
 	import ResizableSplit from '$lib/components/resizable-split.svelte';
 	import { Switch } from '$lib/components/ui/switch';
 	import DockerRunConverterDialog from '$lib/components/compose/docker-run-converter-dialog.svelte';
@@ -378,6 +379,12 @@
 				/>
 			</div>
 		</div>
+	</div>
+	<div class="px-6 pt-2">
+		<ImageReferenceSelector
+			bind:composeContent={$inputs.composeContent.value}
+			disabled={ui.saving || ui.converting || ui.isLoadingTemplateContent}
+		/>
 	</div>
 
 	<div class="flex min-h-0 flex-1 overflow-hidden">

@@ -10,12 +10,16 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
+	ref "github.com/distribution/reference"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/models"
 	buildgit "github.com/getarcaneapp/arcane/backend/v2/pkg/gitutil"
+	utilsregistry "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/registryauth"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	imagetypes "github.com/getarcaneapp/arcane/types/v2/image"
 	buildapi "go.getarcane.app/builds/api"
@@ -35,6 +39,21 @@ type BuildService struct {
 	gitProbeFn      func(context.Context, string, buildgit.AuthConfig) error
 	gitCloneFn      func(context.Context, string, string, buildgit.AuthConfig) (string, error)
 	gitCleanupFn    func(string) error
+	workspaceMu     sync.Mutex
+	busyWorkspaces  map[string]struct{}
+}
+
+type SourceUpdateMode string
+
+const (
+	SourceUpdateNone    SourceUpdateMode = "none"
+	SourceUpdateGitPull SourceUpdateMode = "git-pull"
+)
+
+type SourceBuildOptions struct {
+	Mode           SourceUpdateMode
+	RegistryID     string
+	RepositoryName string
 }
 
 const buildHistoryOutputLimitBytes = 2 * 1024 * 1024
@@ -54,6 +73,7 @@ func NewBuildService(
 		registryService: registryService,
 		gitRepository:   gitRepository,
 		eventService:    eventService,
+		busyWorkspaces:  make(map[string]struct{}),
 	}
 	var registryAuthProvider buildtypes.RegistryAuthProvider
 	if registryService != nil {
@@ -85,6 +105,14 @@ func (s *BuildService) BuildSettings() buildtypes.BuildSettings {
 }
 
 func (s *BuildService) BuildImage(ctx context.Context, environmentID string, req buildtypes.BuildRequest, progressWriter io.Writer, serviceName string, user *models.User) (*buildtypes.BuildResult, error) {
+	return s.buildImageInternal(ctx, environmentID, req, SourceBuildOptions{}, progressWriter, serviceName, user)
+}
+
+func (s *BuildService) BuildImageWithSourceUpdate(ctx context.Context, environmentID string, req buildtypes.BuildRequest, options SourceBuildOptions, progressWriter io.Writer, serviceName string, user *models.User) (*buildtypes.BuildResult, error) {
+	return s.buildImageInternal(ctx, environmentID, req, options, progressWriter, serviceName, user)
+}
+
+func (s *BuildService) buildImageInternal(ctx context.Context, environmentID string, req buildtypes.BuildRequest, sourceOptions SourceBuildOptions, progressWriter io.Writer, serviceName string, user *models.User) (*buildtypes.BuildResult, error) {
 	if s.builder == nil {
 		return nil, errors.New("build service not available")
 	}
@@ -97,7 +125,7 @@ func (s *BuildService) BuildImage(ctx context.Context, environmentID string, req
 
 	buildRecordID := ""
 	if s.db != nil && strings.TrimSpace(environmentID) != "" {
-		if record, err := s.createBuildRecord(ctx, environmentID, req, user); err != nil {
+		if record, err := s.createBuildRecord(ctx, environmentID, req, sourceOptions.Mode, user); err != nil {
 			slog.WarnContext(ctx, "failed to create build history record", "error", err)
 		} else {
 			buildRecordID = record.ID
@@ -111,11 +139,36 @@ func (s *BuildService) BuildImage(ctx context.Context, environmentID string, req
 		err    error
 	)
 
-	if resolvedReq, cleanupFn, resolveErr := s.resolveBuildRequestInternal(ctx, req, writer, serviceName); resolveErr != nil {
+	resolvedReq := req
+	var sourceMetadata *buildgit.WorktreeUpdate
+	var unlockWorkspace func()
+	if sourceOptions.Mode == SourceUpdateGitPull {
+		resolvedReq, sourceMetadata, unlockWorkspace, err = s.prepareGitSourceBuildInternal(ctx, req, sourceOptions, writer, serviceName)
+	} else if sourceOptions.Mode == SourceUpdateNone || sourceOptions.Mode == "" {
+		unlockWorkspace, err = s.lockOrdinaryLocalBuildInternal(ctx, req)
+	} else {
+		err = fmt.Errorf("unsupported source update mode %q", sourceOptions.Mode)
+	}
+	if unlockWorkspace != nil {
+		defer unlockWorkspace()
+	}
+
+	if err != nil {
+		// The history entry remains useful for source validation/update failures.
+	} else if nextReq, cleanupFn, resolveErr := s.resolveBuildRequestInternal(ctx, resolvedReq, writer, serviceName); resolveErr != nil {
 		err = resolveErr
 	} else {
 		cleanupResolvedContext = cleanupFn
-		result, err = s.builder.BuildImage(ctx, resolvedReq, writer, serviceName)
+		resolvedReq = nextReq
+		if buildRecordID != "" && sourceOptions.Mode == SourceUpdateGitPull {
+			if updateErr := s.updateBuildSourceInternal(ctx, buildRecordID, resolvedReq, sourceOptions.Mode, sourceMetadata); updateErr != nil {
+				err = updateErr
+			} else {
+				result, err = s.builder.BuildImage(ctx, resolvedReq, writer, serviceName)
+			}
+		} else {
+			result, err = s.builder.BuildImage(ctx, resolvedReq, writer, serviceName)
+		}
 	}
 
 	completedAt := time.Now()
@@ -244,6 +297,186 @@ func firstNonEmptyStringInternal(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func (s *BuildService) prepareGitSourceBuildInternal(ctx context.Context, req buildtypes.BuildRequest, options SourceBuildOptions, progressWriter io.Writer, serviceName string) (buildtypes.BuildRequest, *buildgit.WorktreeUpdate, func(), error) {
+	noop := func() {}
+	if options.Mode != SourceUpdateGitPull {
+		return req, nil, noop, fmt.Errorf("unsupported source update mode %q", options.Mode)
+	}
+	if s.effectiveBuildProviderInternal(req.Provider) != "local" {
+		return req, nil, noop, errors.New("git source updates are only supported by the local build provider")
+	}
+	if s.settings == nil || s.registryService == nil || s.gitRepository == nil || s.gitRepository.gitClient == nil {
+		return req, nil, noop, errors.New("git source build dependencies are not available")
+	}
+
+	root, err := filepath.Abs(s.settings.GetStringSetting(ctx, "buildsDirectory", "/builds"))
+	if err != nil {
+		return req, nil, noop, fmt.Errorf("failed to resolve builds directory: %w", err)
+	}
+	root, err = filepath.EvalSymlinks(filepath.Clean(root))
+	if err != nil {
+		return req, nil, noop, fmt.Errorf("failed to resolve builds directory: %w", err)
+	}
+	contextPath, err := filepath.Abs(filepath.Clean(req.ContextDir))
+	if err != nil {
+		return req, nil, noop, fmt.Errorf("failed to resolve build context: %w", err)
+	}
+	contextPath, err = filepath.EvalSymlinks(contextPath)
+	if err != nil {
+		return req, nil, noop, fmt.Errorf("failed to resolve build context: %w", err)
+	}
+	rel, err := filepath.Rel(root, contextPath)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return req, nil, noop, errors.New("git build context must be a source directory inside the configured builds directory")
+	}
+	info, err := os.Stat(contextPath)
+	if err != nil || !info.IsDir() {
+		return req, nil, noop, errors.New("git build context is not a directory")
+	}
+
+	if !s.tryLockWorkspaceInternal(contextPath) {
+		return req, nil, noop, errors.New("this source directory is already being built")
+	}
+	unlock := func() { s.unlockWorkspaceInternal(contextPath) }
+
+	registryID := strings.TrimSpace(options.RegistryID)
+	repositoryName := strings.TrimSpace(options.RepositoryName)
+	if registryID == "" || repositoryName == "" {
+		unlock()
+		return req, nil, noop, errors.New("an enabled registry and configured repository are required")
+	}
+	registry, err := s.registryService.GetRegistryByID(ctx, registryID)
+	if err != nil {
+		unlock()
+		return req, nil, noop, fmt.Errorf("failed to load target registry: %w", err)
+	}
+	if !registry.Enabled {
+		unlock()
+		return req, nil, noop, errors.New("target registry is disabled")
+	}
+	if !slices.Contains([]string(registry.RepositoryNames), repositoryName) {
+		unlock()
+		return req, nil, noop, errors.New("target repository is not configured for this registry")
+	}
+
+	writeBuildProgressStatusInternal(progressWriter, serviceName, "checking Git workspace")
+	isRepository, err := s.gitRepository.gitClient.IsRepository(ctx, contextPath)
+	if err != nil {
+		unlock()
+		return req, nil, noop, err
+	}
+	if !isRepository {
+		writeBuildProgressStatusInternal(progressWriter, serviceName, "no Git repository found; continuing without source update")
+		registryPrefix := utilsregistry.NormalizeRegistryURL(registry.URL)
+		imageReference := registryPrefix + "/" + repositoryName + ":latest"
+		if _, err := ref.ParseNormalizedNamed(imageReference); err != nil {
+			unlock()
+			return req, nil, noop, fmt.Errorf("generated image reference is invalid: %w", err)
+		}
+		req.ContextDir = contextPath
+		req.Tags = []string{imageReference}
+		req.Push = true
+		req.Load = false
+		return req, nil, unlock, nil
+	}
+	update, err := s.gitRepository.gitClient.UpdateWorktreeFastForward(ctx, contextPath, buildgit.AuthConfig{})
+	if err != nil {
+		unlock()
+		return req, nil, noop, err
+	}
+	if len(update.Revision) < 12 {
+		unlock()
+		return req, nil, noop, errors.New("updated Git revision is invalid")
+	}
+	status := "source is up to date"
+	if update.Updated {
+		status = "source updated"
+	}
+	writeBuildProgressStatusInternal(progressWriter, serviceName, status)
+	writeBuildProgressStatusInternal(progressWriter, serviceName, "resolved revision "+update.Revision[:12])
+
+	registryPrefix := utilsregistry.NormalizeRegistryURL(registry.URL)
+	imageReference := registryPrefix + "/" + repositoryName + ":sha-" + strings.ToLower(update.Revision[:12])
+	if _, err := ref.ParseNormalizedNamed(imageReference); err != nil {
+		unlock()
+		return req, nil, noop, fmt.Errorf("generated image reference is invalid: %w", err)
+	}
+	req.ContextDir = contextPath
+	req.Tags = []string{imageReference}
+	req.Push = true
+	req.Load = false
+	return req, update, unlock, nil
+}
+
+func (s *BuildService) tryLockWorkspaceInternal(path string) bool {
+	s.workspaceMu.Lock()
+	defer s.workspaceMu.Unlock()
+	if _, exists := s.busyWorkspaces[path]; exists {
+		return false
+	}
+	s.busyWorkspaces[path] = struct{}{}
+	return true
+}
+
+func (s *BuildService) lockOrdinaryLocalBuildInternal(ctx context.Context, req buildtypes.BuildRequest) (func(), error) {
+	noop := func() {}
+	if s.effectiveBuildProviderInternal(req.Provider) != "local" || s.settings == nil || contextsource.IsPotentialRemoteBuildContextSource(req.ContextDir) {
+		return noop, nil
+	}
+	root, err := filepath.Abs(s.settings.GetStringSetting(ctx, "buildsDirectory", "/builds"))
+	if err != nil {
+		return noop, nil
+	}
+	root, err = filepath.EvalSymlinks(filepath.Clean(root))
+	if err != nil {
+		return noop, nil
+	}
+	path, err := filepath.Abs(filepath.Clean(req.ContextDir))
+	if err != nil {
+		return noop, nil
+	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		return noop, nil
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return noop, nil
+	}
+	lockPath := path
+	for current := path; current != root && current != filepath.Dir(current); current = filepath.Dir(current) {
+		if info, statErr := os.Stat(filepath.Join(current, ".git")); statErr == nil && (info.IsDir() || info.Mode().IsRegular()) {
+			lockPath = current
+			break
+		}
+	}
+	if !s.tryLockWorkspaceInternal(lockPath) {
+		return noop, errors.New("this source directory is already being built")
+	}
+	return func() { s.unlockWorkspaceInternal(lockPath) }, nil
+}
+
+func (s *BuildService) unlockWorkspaceInternal(path string) {
+	s.workspaceMu.Lock()
+	delete(s.busyWorkspaces, path)
+	s.workspaceMu.Unlock()
+}
+
+func (s *BuildService) updateBuildSourceInternal(ctx context.Context, buildID string, req buildtypes.BuildRequest, mode SourceUpdateMode, source *buildgit.WorktreeUpdate) error {
+	updates := map[string]any{
+		"tags":               models.StringSlice(req.Tags),
+		"push":               req.Push,
+		"load":               req.Load,
+		"source_update_mode": string(mode),
+	}
+	if source != nil {
+		updates["source_revision"] = source.Revision
+		updates["source_branch"] = source.Branch
+		updates["source_repository"] = sanitizeBuildContextForEventInternal(source.RemoteURL)
+	}
+	return s.db.WithContext(ctx).Model(&models.ImageBuild{}).Where("id = ?", buildID).Updates(updates).Error
 }
 
 func (s *BuildService) resolveBuildRequestInternal(
@@ -432,7 +665,7 @@ func (s *BuildService) GetImageBuildByID(ctx context.Context, environmentID, bui
 	return new(buildToRecord(build, true)), nil
 }
 
-func (s *BuildService) createBuildRecord(ctx context.Context, environmentID string, req buildtypes.BuildRequest, user *models.User) (*models.ImageBuild, error) {
+func (s *BuildService) createBuildRecord(ctx context.Context, environmentID string, req buildtypes.BuildRequest, sourceMode SourceUpdateMode, user *models.User) (*models.ImageBuild, error) {
 	buildArgs := mapToJSON(req.BuildArgs)
 	labels := mapToJSON(req.Labels)
 	ulimits := mapToJSON(req.Ulimits)
@@ -445,31 +678,32 @@ func (s *BuildService) createBuildRecord(ctx context.Context, environmentID stri
 	}
 
 	record := &models.ImageBuild{
-		EnvironmentID: environmentID,
-		UserID:        userID,
-		Username:      username,
-		Status:        models.ImageBuildStatusRunning,
-		Provider:      req.Provider,
-		ContextDir:    req.ContextDir,
-		Dockerfile:    req.Dockerfile,
-		Target:        req.Target,
-		Tags:          models.StringSlice(req.Tags),
-		Platforms:     models.StringSlice(req.Platforms),
-		BuildArgs:     buildArgs,
-		Labels:        labels,
-		CacheFrom:     models.StringSlice(req.CacheFrom),
-		CacheTo:       models.StringSlice(req.CacheTo),
-		NoCache:       req.NoCache,
-		Pull:          req.Pull,
-		BuildNetwork:  req.Network,
-		Isolation:     req.Isolation,
-		ShmSize:       req.ShmSize,
-		Ulimits:       ulimits,
-		Entitlements:  models.StringSlice(req.Entitlements),
-		Privileged:    req.Privileged,
-		ExtraHosts:    models.StringSlice(req.ExtraHosts),
-		Push:          req.Push,
-		Load:          req.Load,
+		EnvironmentID:    environmentID,
+		UserID:           userID,
+		Username:         username,
+		Status:           models.ImageBuildStatusRunning,
+		Provider:         req.Provider,
+		ContextDir:       req.ContextDir,
+		Dockerfile:       req.Dockerfile,
+		Target:           req.Target,
+		Tags:             models.StringSlice(req.Tags),
+		Platforms:        models.StringSlice(req.Platforms),
+		BuildArgs:        buildArgs,
+		Labels:           labels,
+		CacheFrom:        models.StringSlice(req.CacheFrom),
+		CacheTo:          models.StringSlice(req.CacheTo),
+		NoCache:          req.NoCache,
+		Pull:             req.Pull,
+		BuildNetwork:     req.Network,
+		Isolation:        req.Isolation,
+		ShmSize:          req.ShmSize,
+		Ulimits:          ulimits,
+		Entitlements:     models.StringSlice(req.Entitlements),
+		Privileged:       req.Privileged,
+		ExtraHosts:       models.StringSlice(req.ExtraHosts),
+		Push:             req.Push,
+		Load:             req.Load,
+		SourceUpdateMode: string(sourceMode),
 		BaseModel: models.BaseModel{
 			CreatedAt: time.Now(),
 		},
@@ -532,39 +766,43 @@ func buildToRecord(build models.ImageBuild, includeOutput bool) imagetypes.Build
 	}
 
 	return imagetypes.BuildRecord{
-		ID:              build.ID,
-		EnvironmentID:   build.EnvironmentID,
-		UserID:          build.UserID,
-		Username:        build.Username,
-		Status:          string(build.Status),
-		Provider:        build.Provider,
-		ContextDir:      build.ContextDir,
-		Dockerfile:      build.Dockerfile,
-		Target:          build.Target,
-		Tags:            []string(build.Tags),
-		Platforms:       []string(build.Platforms),
-		BuildArgs:       buildArgs,
-		Labels:          labels,
-		CacheFrom:       []string(build.CacheFrom),
-		CacheTo:         []string(build.CacheTo),
-		NoCache:         build.NoCache,
-		Pull:            build.Pull,
-		Network:         build.BuildNetwork,
-		Isolation:       build.Isolation,
-		ShmSize:         build.ShmSize,
-		Ulimits:         ulimits,
-		Entitlements:    []string(build.Entitlements),
-		Privileged:      build.Privileged,
-		ExtraHosts:      []string(build.ExtraHosts),
-		Push:            build.Push,
-		Load:            build.Load,
-		Digest:          build.Digest,
-		ErrorMessage:    build.ErrorMessage,
-		Output:          output,
-		OutputTruncated: build.OutputTruncated,
-		CompletedAt:     build.CompletedAt,
-		DurationMs:      build.DurationMs,
-		CreatedAt:       build.CreatedAt,
+		ID:               build.ID,
+		EnvironmentID:    build.EnvironmentID,
+		UserID:           build.UserID,
+		Username:         build.Username,
+		Status:           string(build.Status),
+		Provider:         build.Provider,
+		ContextDir:       build.ContextDir,
+		Dockerfile:       build.Dockerfile,
+		Target:           build.Target,
+		Tags:             []string(build.Tags),
+		Platforms:        []string(build.Platforms),
+		BuildArgs:        buildArgs,
+		Labels:           labels,
+		CacheFrom:        []string(build.CacheFrom),
+		CacheTo:          []string(build.CacheTo),
+		NoCache:          build.NoCache,
+		Pull:             build.Pull,
+		Network:          build.BuildNetwork,
+		Isolation:        build.Isolation,
+		ShmSize:          build.ShmSize,
+		Ulimits:          ulimits,
+		Entitlements:     []string(build.Entitlements),
+		Privileged:       build.Privileged,
+		ExtraHosts:       []string(build.ExtraHosts),
+		Push:             build.Push,
+		Load:             build.Load,
+		SourceUpdateMode: build.SourceUpdateMode,
+		SourceRevision:   build.SourceRevision,
+		SourceBranch:     build.SourceBranch,
+		SourceRepository: build.SourceRepository,
+		Digest:           build.Digest,
+		ErrorMessage:     build.ErrorMessage,
+		Output:           output,
+		OutputTruncated:  build.OutputTruncated,
+		CompletedAt:      build.CompletedAt,
+		DurationMs:       build.DurationMs,
+		CreatedAt:        build.CreatedAt,
 	}
 }
 

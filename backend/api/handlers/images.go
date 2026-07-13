@@ -133,7 +133,14 @@ type PullImageInput struct {
 
 type BuildImageInput struct {
 	EnvironmentID string `path:"id" doc:"Environment ID"`
-	Body          buildtypes.BuildRequest
+	Body          BuildImageRequest
+}
+
+type BuildImageRequest struct {
+	buildtypes.BuildRequest
+	SourceUpdateMode services.SourceUpdateMode `json:"sourceUpdateMode,omitempty" doc:"Optional source update mode"`
+	RegistryID       string                    `json:"registryId,omitempty" doc:"Configured target registry ID"`
+	RepositoryName   string                    `json:"repositoryName,omitempty" doc:"Configured target repository"`
 }
 
 type ImageBuildPaginatedResponse struct {
@@ -778,10 +785,13 @@ func (h *ImageHandler) BuildImage(ctx context.Context, input *BuildImageInput) (
 			}
 
 			writer := activitylib.NewWriter(runtimeCtx, h.activityService, activityID, rawWriter, "Building image")
-			if _, err := h.buildService.BuildImage(runtimeCtx, input.EnvironmentID, input.Body, writer, "", user); err != nil {
+			_, buildErr := h.buildService.BuildImageWithSourceUpdate(runtimeCtx, input.EnvironmentID, input.Body.BuildRequest, services.SourceBuildOptions{
+				Mode: input.Body.SourceUpdateMode, RegistryID: input.Body.RegistryID, RepositoryName: input.Body.RepositoryName,
+			}, writer, "", user)
+			if buildErr != nil {
 				activitylib.FlushWriter(writer)
-				activitylib.CompleteHandlerActivity(runtimeCtx, h.activityService, activityID, "Image build failed", err)
-				_, _ = fmt.Fprintf(writer, `{"error":%q}`+"\n", err.Error())
+				activitylib.CompleteHandlerActivity(runtimeCtx, h.activityService, activityID, "Image build failed", buildErr)
+				_, _ = fmt.Fprintf(writer, `{"error":%q}`+"\n", buildErr.Error())
 				return
 			}
 			activitylib.FlushWriter(writer)

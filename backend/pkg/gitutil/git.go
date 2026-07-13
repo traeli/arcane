@@ -50,6 +50,14 @@ type Client struct {
 	workDir string
 }
 
+// WorktreeUpdate describes the checked out source after a fast-forward update.
+type WorktreeUpdate struct {
+	Revision  string
+	Branch    string
+	RemoteURL string
+	Updated   bool
+}
+
 var scpLikeURLPattern = regexp.MustCompile(`^[^@/]+@[^:/]+:`)
 
 const errUnsupportedURL = "repository URL must use http(s)://, ssh://, git://, or git@host:path"
@@ -138,7 +146,14 @@ func (c *Client) getAuth(config AuthConfig) (transport.AuthMethod, error) {
 			return publicKeys, nil
 		}
 		return nil, errors.New("ssh key required for ssh authentication")
-	case "none":
+	case "none", "":
+		if os.Getenv("SSH_AUTH_SOCK") != "" {
+			auth, err := ssh.NewSSHAgentAuth("git")
+			if err != nil {
+				return nil, fmt.Errorf("failed to use SSH agent authentication: %w", err)
+			}
+			return auth, nil
+		}
 		return nil, nil
 	default:
 		return nil, nil
@@ -350,6 +365,103 @@ func (c *Client) GetCurrentCommit(ctx context.Context, repoPath string) (string,
 	}
 
 	return ref.Hash().String(), nil
+}
+
+// IsRepository reports whether repoPath is a Git worktree. A missing repository
+// is not an error so callers can support non-Git build directories explicitly.
+func (c *Client) IsRepository(ctx context.Context, repoPath string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	_, err := git.PlainOpen(repoPath)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, git.ErrRepositoryNotExists) {
+		return false, nil
+	}
+	return false, fmt.Errorf("failed to inspect repository: %w", err)
+}
+
+// UpdateWorktreeFastForward validates a clean branch worktree and pulls its
+// configured upstream without creating a merge commit.
+func (c *Client) UpdateWorktreeFastForward(ctx context.Context, repoPath string, authConfig AuthConfig) (*WorktreeUpdate, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	repo, err := git.PlainOpen(repoPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open repository: %w", err)
+	}
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return nil, fmt.Errorf("failed to open git worktree: %w", err)
+	}
+	status, err := worktree.Status()
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect git worktree: %w", err)
+	}
+	if !status.IsClean() {
+		return nil, errors.New("git worktree has modified or untracked files")
+	}
+
+	head, err := repo.Head()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get HEAD: %w", err)
+	}
+	if !head.Name().IsBranch() {
+		return nil, errors.New("git worktree has a detached HEAD")
+	}
+	branchName := head.Name().Short()
+	branch, err := repo.Branch(branchName)
+	if err != nil {
+		if errors.Is(err, git.ErrBranchNotFound) {
+			return nil, errors.New("current git branch has no upstream")
+		}
+		return nil, fmt.Errorf("failed to read current branch: %w", err)
+	}
+	if branch.Remote == "" || branch.Merge == "" {
+		return nil, errors.New("current git branch has no upstream")
+	}
+	remote, err := repo.Remote(branch.Remote)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read git upstream: %w", err)
+	}
+	if len(remote.Config().URLs) == 0 {
+		return nil, errors.New("git upstream has no URL")
+	}
+
+	auth, err := c.getAuth(authConfig)
+	if err != nil {
+		return nil, err
+	}
+	before := head.Hash().String()
+	err = worktree.PullContext(ctx, &git.PullOptions{
+		RemoteName:    branch.Remote,
+		ReferenceName: branch.Merge,
+		SingleBranch:  true,
+		Auth:          auth,
+	})
+	if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+		if errors.Is(err, git.ErrNonFastForwardUpdate) {
+			return nil, errors.New("git upstream cannot be fast-forwarded")
+		}
+		return nil, fmt.Errorf("failed to update git worktree: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	after, err := repo.Head()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get updated HEAD: %w", err)
+	}
+
+	return &WorktreeUpdate{
+		Revision:  after.Hash().String(),
+		Branch:    branchName,
+		RemoteURL: remote.Config().URLs[0],
+		Updated:   before != after.Hash().String(),
+	}, nil
 }
 
 // BranchInfo holds information about a git branch

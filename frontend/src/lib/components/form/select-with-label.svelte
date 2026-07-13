@@ -41,10 +41,10 @@
 {#snippet optionItems()}
 	{#each options as option (option.value)}
 		<Select.Item value={option.value}>
-			<div class="flex flex-col items-start gap-1">
-				<span class="font-medium">{option.label}</span>
+			<div class="min-w-0 flex-1">
+				<div class="truncate font-medium" title={option.label}>{option.label}</div>
 				{#if option.description}
-					<span class="text-muted-foreground text-xs">{option.description}</span>
+					<div class="text-muted-foreground truncate text-xs" title={option.description}>{option.description}</div>
 				{/if}
 			</div>
 		</Select.Item>
@@ -69,7 +69,7 @@
 
 	<Select.Root type="single" bind:value {name} {disabled} onValueChange={(v) => onValueChange?.(v)}>
 		<Select.Trigger size={triggerSize} class="{triggerClass} {error ? 'border-destructive' : ''}" {id}>
-			<span>{selectedLabel}</span>
+			<span class="min-w-0 flex-1 truncate text-left" title={selectedLabel}>{selectedLabel}</span>
 		</Select.Trigger>
 
 		<Select.Content>

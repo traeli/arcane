@@ -12,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	gitlib "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	gossh "golang.org/x/crypto/ssh"
@@ -23,6 +26,97 @@ import (
 func TestInitAllowsMultiAckCapabilities(t *testing.T) {
 	if len(transport.UnsupportedCapabilities) != 1 || transport.UnsupportedCapabilities[0] != capability.ThinPack {
 		t.Errorf("expected UnsupportedCapabilities to contain only thin-pack, got %v", transport.UnsupportedCapabilities)
+	}
+}
+
+func TestUpdateWorktreeFastForwardRejectsUnsafeStates(t *testing.T) {
+	newRepository := func(t *testing.T) (string, *gitlib.Repository) {
+		t.Helper()
+		path := t.TempDir()
+		repository, err := gitlib.PlainInit(path, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "tracked.txt"), []byte("initial"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		worktree, _ := repository.Worktree()
+		_, _ = worktree.Add("tracked.txt")
+		_, err = worktree.Commit("initial", &gitlib.CommitOptions{Author: &object.Signature{Name: "Arcane", Email: "test@example.com", When: time.Now()}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return path, repository
+	}
+
+	t.Run("dirty tracked file", func(t *testing.T) {
+		path, _ := newRepository(t)
+		if err := os.WriteFile(filepath.Join(path, "tracked.txt"), []byte("dirty"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := NewClient("").UpdateWorktreeFastForward(context.Background(), path, AuthConfig{})
+		if err == nil || !strings.Contains(err.Error(), "modified or untracked") {
+			t.Fatalf("expected dirty worktree error, got %v", err)
+		}
+	})
+
+	t.Run("untracked file", func(t *testing.T) {
+		path, _ := newRepository(t)
+		if err := os.WriteFile(filepath.Join(path, "untracked.txt"), []byte("dirty"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := NewClient("").UpdateWorktreeFastForward(context.Background(), path, AuthConfig{})
+		if err == nil || !strings.Contains(err.Error(), "modified or untracked") {
+			t.Fatalf("expected dirty worktree error, got %v", err)
+		}
+	})
+
+	t.Run("detached HEAD", func(t *testing.T) {
+		path, repository := newRepository(t)
+		head, _ := repository.Head()
+		if err := repository.Storer.SetReference(plumbing.NewHashReference(plumbing.HEAD, head.Hash())); err != nil {
+			t.Fatal(err)
+		}
+		_, err := NewClient("").UpdateWorktreeFastForward(context.Background(), path, AuthConfig{})
+		if err == nil || !strings.Contains(err.Error(), "detached HEAD") {
+			t.Fatalf("expected detached HEAD error, got %v", err)
+		}
+	})
+
+	t.Run("branch without upstream", func(t *testing.T) {
+		path, _ := newRepository(t)
+		_, err := NewClient("").UpdateWorktreeFastForward(context.Background(), path, AuthConfig{})
+		if err == nil || !strings.Contains(err.Error(), "no upstream") {
+			t.Fatalf("expected upstream error, got %v", err)
+		}
+	})
+
+	t.Run("cancelled", func(t *testing.T) {
+		path, _ := newRepository(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := NewClient("").UpdateWorktreeFastForward(ctx, path, AuthConfig{})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context cancellation, got %v", err)
+		}
+	})
+}
+
+func TestIsRepository(t *testing.T) {
+	client := NewClient("")
+	nonRepository := t.TempDir()
+	ok, err := client.IsRepository(context.Background(), nonRepository)
+	if err != nil || ok {
+		t.Fatalf("expected non-repository without error, got ok=%v err=%v", ok, err)
+	}
+
+	repository := t.TempDir()
+	if _, err := gitlib.PlainInit(repository, false); err != nil {
+		t.Fatal(err)
+	}
+	ok, err = client.IsRepository(context.Background(), repository)
+	if err != nil || !ok {
+		t.Fatalf("expected Git repository, got ok=%v err=%v", ok, err)
 	}
 }
 
