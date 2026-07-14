@@ -3,6 +3,19 @@ import { environmentStore } from '$lib/stores/environment.store.svelte';
 import type { FileEntry, FileContentResponse } from '$lib/types/shared';
 import { downloadBlob, filenameFromPath } from '$lib/utils/browser-download';
 
+export type WorkspaceGitUpdate = {
+	updated: boolean;
+	branch: string;
+	beforeCommit: string;
+	afterCommit: string;
+};
+
+export type WorkspaceSourceInfo = {
+	isGitRepository: boolean;
+	revision?: string;
+	suggestedTag?: string;
+};
+
 class BuildWorkspaceService extends BaseAPIService {
 	async listDirectory(path: string = '/'): Promise<FileEntry[]> {
 		const envId = await environmentStore.getCurrentEnvironmentId();
@@ -46,6 +59,24 @@ class BuildWorkspaceService extends BaseAPIService {
 		return this.handleResponse(
 			this.api.post(`/environments/${envId}/builds/browse/mkdir`, null, {
 				params: { path }
+			})
+		);
+	}
+
+	async updateGitWorkspace(contextDir: string): Promise<WorkspaceGitUpdate> {
+		const envId = await environmentStore.getCurrentEnvironmentId();
+		return this.handleResponse(
+			this.api.post(`/environments/${envId}/builds/git-update`, {
+				contextDir
+			})
+		);
+	}
+
+	async getWorkspaceSourceInfo(contextDir: string): Promise<WorkspaceSourceInfo> {
+		const envId = await environmentStore.getCurrentEnvironmentId();
+		return this.handleResponse(
+			this.api.get(`/environments/${envId}/builds/source-info`, {
+				params: { contextDir }
 			})
 		);
 	}

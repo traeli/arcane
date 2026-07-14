@@ -50,6 +50,7 @@
 	import type { BuildProviderOption } from './components/build-form.types';
 	import { imageService } from '$lib/services/image-service';
 	import { containerRegistryService } from '$lib/services/container-registry-service';
+	import { buildWorkspaceService } from '$lib/services/build-workspace-service';
 	import type { ImageBuildRecord, ImageBuildStatus } from '$lib/types/docker';
 	import type { Paginated, SearchPaginationSortRequest } from '$lib/types/shared';
 	import { queryKeys } from '$lib/query/query-keys';
@@ -120,8 +121,8 @@
 		noCache: z.boolean().default(false),
 		pull: z.boolean().default(false),
 		provider: z.enum(['local', 'depot']).default('local'),
-		push: z.boolean().default(false),
-		load: z.boolean().default(true)
+		push: z.boolean().default(true),
+		load: z.boolean().default(false)
 	});
 
 	const { inputs, ...form } = createForm<typeof formSchema>(formSchema, {
@@ -146,11 +147,12 @@
 		noCache: false,
 		pull: false,
 		provider: ($settingsStore?.buildProvider as 'local' | 'depot') ?? 'local',
-		push: false,
-		load: true
+		push: true,
+		load: false
 	});
 
 	let isBuilding = $state(false);
+	let isGitUpdating = $state(false);
 	let isDesktop = $state(true);
 	let buildProgress = $state(0);
 	let buildStatusText = $state('');
@@ -162,7 +164,11 @@
 	let mainTab = $state<'build' | 'history'>('build');
 	let buildTab = $state('workspace');
 	let rightPanelTab = $state<'config' | 'output'>('config');
+	let quickBuildOpen = $state(false);
 	let showAdvanced = $state(false);
+	let quickDirectory = $state('');
+	let quickRegistryId = $state('');
+	let quickTag = $state('');
 	const EMPTY_BUILD_HISTORY: Paginated<ImageBuildRecord> = {
 		data: [],
 		pagination: { totalPages: 1, totalItems: 0, currentPage: 1, itemsPerPage: 20 }
@@ -180,6 +186,40 @@
 
 	const selectedEnvId = $derived(environmentStore.selected?.id || '0');
 	const queryClient = useQueryClient();
+
+	const quickDirectoriesQuery = createQuery(() => ({
+		queryKey: queryKeys.buildWorkspace.list(selectedEnvId, '/'),
+		queryFn: () => buildWorkspaceService.listDirectory('/')
+	}));
+
+	const quickDirectoryOptions = $derived.by(() =>
+		(quickDirectoriesQuery.data ?? [])
+			.filter((entry) => entry.isDirectory && !entry.isSymlink)
+			.map((entry) => ({ label: entry.name, value: entry.path }))
+	);
+
+	const quickContextDir = $derived.by(() => {
+		if (!quickDirectory) return '';
+		const root = buildsRoot.endsWith('/') ? buildsRoot.slice(0, -1) : buildsRoot;
+		return `${root}${quickDirectory.startsWith('/') ? '' : '/'}${quickDirectory}`;
+	});
+
+	const quickSourceInfoQuery = createQuery(() => ({
+		queryKey: queryKeys.buildWorkspace.sourceInfo(selectedEnvId, quickContextDir),
+		enabled: Boolean(quickContextDir),
+		queryFn: () => buildWorkspaceService.getWorkspaceSourceInfo(quickContextDir)
+	}));
+	const quickIsGitRepository = $derived(quickSourceInfoQuery.data?.isGitRepository === true);
+	let lastQuickTagDirectory = $state('');
+	$effect(() => {
+		if (quickDirectory !== lastQuickTagDirectory) {
+			lastQuickTagDirectory = quickDirectory;
+			quickTag = '';
+		}
+		if (!quickSourceInfoQuery.isFetching && quickSourceInfoQuery.data?.isGitRepository) {
+			quickTag = quickSourceInfoQuery.data.suggestedTag ?? '';
+		}
+	});
 
 	const buildHistoryQuery = createQuery(() => ({
 		queryKey: queryKeys.images.buildsList(selectedEnvId, buildHistoryRequestOptions),
@@ -220,6 +260,19 @@
 	});
 
 	const selectedRegistry = $derived((registriesQuery.data?.data ?? []).find((r) => r.id === $inputs.registryId.value));
+	const selectedQuickRegistry = $derived(
+		(registriesQuery.data?.data ?? []).find((registry) => registry.id === quickRegistryId && registry.enabled)
+	);
+	const quickImageReference = $derived.by(() => {
+		if (!quickDirectory) return '';
+		const repository = quickDirectory.split('/').filter(Boolean).pop() ?? '';
+		if (!repository) return '';
+		const tag = quickTag.trim();
+		if (!tag) return '';
+		if (!$inputs.push.value) return `${repository}:${tag}`;
+		if (!selectedQuickRegistry) return '';
+		return `${normalizeRegistryHost(selectedQuickRegistry.url)}/${repository}:${tag}`;
+	});
 
 	const repositoryOptions = $derived((selectedRegistry?.repositoryNames ?? []).map((name) => ({ label: name, value: name })));
 	const sourceImageName = $derived(
@@ -228,15 +281,6 @@
 			.replace(/[^a-z0-9._-]+/g, '-')
 			.replace(/^[-._]+|[-._]+$/g, '')
 	);
-	const canGitBuild = $derived(
-		contextMode === 'workspace' &&
-			selectedContextPath !== '/' &&
-			resolvedProvider === 'local' &&
-			!!selectedRegistry?.enabled &&
-			repositoryOptions.some((option) => option.value === $inputs.repositoryName.value) &&
-			!isBuilding
-	);
-
 	function normalizeRegistryHost(url: string): string {
 		return url.replace(/^https?:\/\//, '').replace(/\/+$/, '');
 	}
@@ -271,6 +315,16 @@
 	});
 
 	let buildHistoryQueryLastError: string | null = null;
+	let lastQuickEnvironmentId = $state('');
+	$effect(() => {
+		if (!lastQuickEnvironmentId) {
+			lastQuickEnvironmentId = selectedEnvId;
+			return;
+		}
+		if (selectedEnvId === lastQuickEnvironmentId) return;
+		lastQuickEnvironmentId = selectedEnvId;
+		quickDirectory = '';
+	});
 
 	$effect(() => {
 		const err = buildHistoryQuery.error as any;
@@ -818,8 +872,8 @@
 		form.setValue('noCache', build.noCache ?? false);
 		form.setValue('pull', build.pull ?? false);
 		form.setValue('provider', (build.provider as 'local' | 'depot') ?? 'local');
-		form.setValue('push', build.push ?? false);
-		form.setValue('load', build.load ?? true);
+		form.setValue('push', build.push ?? true);
+		form.setValue('load', build.load ?? false);
 
 		showAdvanced = Boolean(
 			build.dockerfile ||
@@ -853,12 +907,54 @@
 		buildHistoryDetailsOpen = false;
 	}
 
-	async function handleSubmit(sourceUpdateMode: 'none' | 'git-pull' = 'none') {
+	async function handleGitUpdate() {
+		if (!quickContextDir) {
+			toast.error(m.build_quick_directory_required());
+			return;
+		}
+
+		isGitUpdating = true;
+		try {
+			const result = await buildWorkspaceService.updateGitWorkspace(quickContextDir);
+			const commit = result.afterCommit.slice(0, 12);
+			quickTag = commit;
+			await queryClient.invalidateQueries({
+				queryKey: queryKeys.buildWorkspace.sourceInfo(selectedEnvId, quickContextDir)
+			});
+			toast.success(
+				result.updated
+					? m.build_git_update_success({ branch: result.branch, commit })
+					: m.build_git_already_current({ branch: result.branch, commit })
+			);
+		} catch (error: any) {
+			toast.error(sanitizeLogText(String(error?.message || m.common_error())));
+		} finally {
+			isGitUpdating = false;
+		}
+	}
+
+	async function handleSubmit(sourceUpdateMode: 'none' | 'git-pull' | 'quick-build' = 'none') {
 		const data = form.validate();
 		if (!data) return;
+		const isQuickBuild = sourceUpdateMode === 'quick-build';
+		const activeContextDir = isQuickBuild ? quickContextDir : contextDir;
 
-		if (!contextDir || contextDir.trim() === '') {
-			toast.error(contextMode === 'remote' ? m.build_remote_context_required() : m.build_context_required());
+		if (!activeContextDir || activeContextDir.trim() === '') {
+			toast.error(
+				isQuickBuild
+					? m.build_quick_directory_required()
+					: contextMode === 'remote'
+						? m.build_remote_context_required()
+						: m.build_context_required()
+			);
+			return;
+		}
+		if (isQuickBuild && data.push && !quickRegistryId) {
+			toast.error(m.build_push_registry_required());
+			return;
+		}
+		if (isQuickBuild && !quickTag.trim()) {
+			toast.error(m.build_push_tag_required());
 			return;
 		}
 
@@ -868,15 +964,17 @@
 		buildTab = 'output';
 		isBuilding = true;
 		buildStatusText = m.starting_build();
-		appendLog(m.using_context({ context: contextDir }));
+		appendLog(m.using_context({ context: activeContextDir }));
 
 		const isGitSourceBuild = sourceUpdateMode === 'git-pull';
-		const resolvedProvider = isGitSourceBuild ? 'local' : depotAvailable ? data.provider : 'local';
+		const resolvedProvider = isGitSourceBuild || isQuickBuild ? 'local' : depotAvailable ? data.provider : 'local';
 		const push = isGitSourceBuild || resolvedProvider === 'depot' ? true : data.push;
 		const load = resolvedProvider === 'depot' ? false : data.load;
 
 		let tags: string[];
-		if (isGitSourceBuild) {
+		if (isQuickBuild) {
+			tags = [quickTag.trim()];
+		} else if (isGitSourceBuild) {
 			const reg = (registriesQuery.data?.data ?? []).find((r) => r.id === data.registryId && r.enabled);
 			if (!reg || !reg.repositoryNames?.includes(data.repositoryName.trim())) {
 				toast.error(m.build_git_registry_required());
@@ -942,7 +1040,7 @@
 		}
 
 		const payload = {
-			contextDir: contextDir.trim(),
+			contextDir: activeContextDir.trim(),
 			dockerfile: data.dockerfile?.trim() || undefined,
 			tags,
 			target: data.target?.trim() || undefined,
@@ -964,7 +1062,7 @@
 			push,
 			load,
 			sourceUpdateMode,
-			registryId: isGitSourceBuild ? data.registryId : undefined,
+			registryId: isQuickBuild ? (data.push ? quickRegistryId : undefined) : isGitSourceBuild ? data.registryId : undefined,
 			repositoryName: isGitSourceBuild ? data.repositoryName.trim() : undefined
 		};
 
@@ -1425,14 +1523,7 @@
 				</Tabs.List>
 
 				<div class="flex items-center gap-3 pr-2">
-					<BuildControls
-						{inputs}
-						{providerOptions}
-						{isBuilding}
-						{canGitBuild}
-						onBuild={() => handleSubmit()}
-						onGitBuild={() => handleSubmit('git-pull')}
-					/>
+					<BuildControls {inputs} {providerOptions} {isBuilding} onBuild={() => handleSubmit()} />
 					<div class="bg-border hidden h-4 w-px xl:block"></div>
 					<div class="flex items-center gap-2">
 						<div class="relative flex items-center">
@@ -1460,6 +1551,7 @@
 				<BuildConfigPanel
 					{inputs}
 					provider={$inputs.provider.value}
+					bind:quickBuildOpen
 					bind:showAdvanced
 					{isPushMode}
 					{showRegistrySelection}
@@ -1467,6 +1559,18 @@
 					{repositoryOptions}
 					{fullImageReference}
 					registryLoadError={registriesQuery.error as { message?: string } | null}
+					bind:quickDirectory
+					bind:quickRegistryId
+					bind:quickTag
+					{quickIsGitRepository}
+					quickSourceLoading={quickSourceInfoQuery.isPending || quickSourceInfoQuery.isFetching}
+					{quickDirectoryOptions}
+					quickDirectoriesLoading={quickDirectoriesQuery.isPending || quickDirectoriesQuery.isFetching}
+					{quickImageReference}
+					{isGitUpdating}
+					{isBuilding}
+					onGitUpdate={handleGitUpdate}
+					onQuickBuild={() => handleSubmit('quick-build')}
 					onSubmit={handleSubmit}
 				/>
 			</Tabs.Content>
@@ -1555,14 +1659,7 @@
 
 		{#snippet headerActions()}
 			{#if mainTab === 'build'}
-				<BuildControls
-					{inputs}
-					{providerOptions}
-					{isBuilding}
-					{canGitBuild}
-					onBuild={() => handleSubmit()}
-					onGitBuild={() => handleSubmit('git-pull')}
-				/>
+				<BuildControls {inputs} {providerOptions} {isBuilding} onBuild={() => handleSubmit()} />
 			{/if}
 		{/snippet}
 
@@ -1582,14 +1679,7 @@
 							</div>
 						{/snippet}
 						{#snippet headerActions()}
-							<BuildControls
-								{inputs}
-								{providerOptions}
-								{isBuilding}
-								{canGitBuild}
-								onBuild={() => handleSubmit()}
-								onGitBuild={() => handleSubmit('git-pull')}
-							/>
+							<BuildControls {inputs} {providerOptions} {isBuilding} onBuild={() => handleSubmit()} />
 						{/snippet}
 						{#snippet tabContent(buildTabValue)}
 							{#if buildTabValue === 'workspace'}
@@ -1599,6 +1689,7 @@
 									<BuildConfigPanel
 										{inputs}
 										provider={$inputs.provider.value}
+										bind:quickBuildOpen
 										bind:showAdvanced
 										{isPushMode}
 										{showRegistrySelection}
@@ -1606,6 +1697,18 @@
 										{repositoryOptions}
 										{fullImageReference}
 										registryLoadError={registriesQuery.error as { message?: string } | null}
+										bind:quickDirectory
+										bind:quickRegistryId
+										bind:quickTag
+										{quickIsGitRepository}
+										quickSourceLoading={quickSourceInfoQuery.isPending || quickSourceInfoQuery.isFetching}
+										{quickDirectoryOptions}
+										quickDirectoriesLoading={quickDirectoriesQuery.isPending || quickDirectoriesQuery.isFetching}
+										{quickImageReference}
+										{isGitUpdating}
+										{isBuilding}
+										onGitUpdate={handleGitUpdate}
+										onQuickBuild={() => handleSubmit('quick-build')}
 										onSubmit={handleSubmit}
 									/>
 								</Card.Root>

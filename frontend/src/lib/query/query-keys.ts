@@ -154,6 +154,8 @@ export const queryKeys = {
 		all: ['build-workspace'] as const,
 		listPrefix: (environmentId: string) => ['build-workspace', environmentId, 'list'] as const,
 		list: (environmentId: string, path: string) => ['build-workspace', environmentId, 'list', path] as const,
+		sourceInfo: (environmentId: string, contextDir: string) =>
+			['build-workspace', environmentId, 'source-info', contextDir] as const,
 		contentPrefix: (environmentId: string) => ['build-workspace', environmentId, 'content'] as const,
 		content: (environmentId: string, path: string) => ['build-workspace', environmentId, 'content', path] as const
 	}

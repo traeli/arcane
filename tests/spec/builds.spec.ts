@@ -33,6 +33,12 @@ async function ensureSwitchState(toggle: Locator, desired: boolean) {
 
 async function setRequiredBuildInputs(page: Page, tags = `e2e/build:${Date.now()}`) {
 	const tagsInput = page.locator('#image-tags');
+	if (!(await tagsInput.isVisible().catch(() => false))) {
+		await page
+			.getByRole('button', { name: /Advanced/i })
+			.first()
+			.click();
+	}
 	await expect(tagsInput).toBeVisible();
 	await tagsInput.fill(tags);
 }
@@ -91,7 +97,9 @@ function upsertSettingEntry(
 
 function injectDepotSettings(payload: unknown): unknown {
 	if (Array.isArray(payload)) {
-		const settings = payload.map((entry) => ({ ...(entry as { key: string; value: unknown }) }));
+		const settings = payload.map((entry) => ({
+			...(entry as { key: string; value: unknown })
+		}));
 		upsertSettingEntry(settings, 'depotProjectId', 'e2e-depot-project');
 		upsertSettingEntry(settings, 'depotToken', 'e2e-depot-token');
 		upsertSettingEntry(settings, 'depotConfigured', 'true');
@@ -148,6 +156,135 @@ async function mockDepotConfiguredSettings(page: Page) {
 }
 
 test.describe('Build workspace provider flows', () => {
+	test('updates Git and submits a convention-based quick build', async ({ page }) => {
+		await page.route('**/api/environments/*/builds/browse?**', async (route) => {
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					success: true,
+					data: [
+						{
+							name: 'order-service',
+							path: '/order-service',
+							isDirectory: true,
+							size: 0,
+							modTime: new Date().toISOString(),
+							mode: 'drwxr-xr-x',
+							isSymlink: false
+						}
+					]
+				})
+			});
+		});
+		await page.route(/\/api\/container-registries(?:\?|$)/, async (route) => {
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					success: true,
+					data: [
+						{
+							id: 'registry-quick',
+							url: 'registry.example.com',
+							username: 'builder',
+							enabled: true,
+							insecure: false,
+							registryType: 'generic',
+							repositoryNames: []
+						}
+					],
+					pagination: {
+						totalPages: 1,
+						totalItems: 1,
+						currentPage: 1,
+						itemsPerPage: 100
+					}
+				})
+			});
+		});
+		await page.route('**/api/environments/*/builds/source-info?**', async (route) => {
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					success: true,
+					data: {
+						isGitRepository: true,
+						revision: '2222222222222222222222222222222222222222',
+						suggestedTag: '222222222222'
+					}
+				})
+			});
+		});
+
+		let gitPayload: Record<string, unknown> | null = null;
+		let gitUpdateRequestCount = 0;
+		await page.route('**/api/environments/*/builds/git-update', async (route) => {
+			gitUpdateRequestCount += 1;
+			gitPayload = route.request().postDataJSON() as Record<string, unknown>;
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					success: true,
+					data: {
+						updated: true,
+						branch: 'main',
+						beforeCommit: '1111111111111111111111111111111111111111',
+						afterCommit: '2222222222222222222222222222222222222222'
+					}
+				})
+			});
+		});
+
+		let buildPayload: Record<string, unknown> | null = null;
+		await page.route('**/api/environments/*/images/build', async (route) => {
+			buildPayload = route.request().postDataJSON() as Record<string, unknown>;
+			await route.fulfill({
+				status: 200,
+				contentType: 'application/x-ndjson',
+				body: STREAM_SUCCESS
+			});
+		});
+
+		await navigateToBuildWorkspace(page);
+		await page.reload();
+		await expect(page.locator('#build-quick-directory')).toBeHidden();
+		await page.locator('#build-quick-toggle').click();
+		await expect(page.locator('#build-quick-directory')).toBeVisible();
+		await page.locator('#build-quick-directory').click();
+		const directoryOption = page.getByRole('option', { name: 'order-service' });
+		await directoryOption.click();
+		await expect(directoryOption).toBeHidden();
+		await page.locator('#build-quick-registry').click();
+		await page.getByRole('option', { name: /registry\.example\.com/ }).click();
+		await expect(page.locator('#build-quick-tag')).toHaveValue('222222222222');
+		await expect(page.locator('#build-quick-tag')).toBeDisabled();
+
+		await expect(page.locator('#build-push')).toHaveAttribute('aria-checked', 'true');
+		await expect(page.locator('#build-load')).toHaveAttribute('aria-checked', 'false');
+		await expect(page.locator('#build-quick-push')).toHaveCount(0);
+		await expect(page.locator('#build-quick-load')).toHaveCount(0);
+
+		await page.locator('#build-git-update').click();
+		await expect.poll(() => gitPayload).not.toBeNull();
+		expect(String(gitPayload?.contextDir)).toMatch(/\/order-service$/);
+
+		await page.locator('#build-quick-action').click();
+		await expect.poll(() => buildPayload).not.toBeNull();
+		expect(gitUpdateRequestCount).toBe(1);
+		expect(buildPayload).toMatchObject({
+			provider: 'local',
+			push: true,
+			load: false,
+			sourceUpdateMode: 'quick-build',
+			registryId: 'registry-quick',
+			tags: ['222222222222']
+		});
+		expect(String(buildPayload?.contextDir)).toMatch(/\/order-service$/);
+	});
+
 	test('submits remote git build context from the dedicated context mode', async ({ page }) => {
 		await navigateToBuildWorkspace(page);
 		await switchContextMode(page, 'Remote Git');

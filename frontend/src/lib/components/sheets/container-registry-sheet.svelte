@@ -186,7 +186,7 @@
 				bind:input={$inputs.description}
 			/>
 			<FormInput
-			label={m.registries_repository_names()}
+				label={m.registries_repository_names()}
 				type="textarea"
 				rows={3}
 				placeholder={m.registries_repository_names_placeholder()}

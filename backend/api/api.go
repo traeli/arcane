@@ -292,7 +292,7 @@ func registerHandlersInternal(api huma.API, svc *di.Services, handlerAppCtx hand
 	handlers.RegisterContainerRegistries(api, svc.ContainerRegistry, svc.Environment)
 	handlers.RegisterTemplates(api, svc.Template, svc.Environment)
 	handlers.RegisterImages(api, svc.Docker, svc.Image, svc.ImageUpdate, svc.Settings, svc.Build, svc.Activity, handlerAppCtx)
-	handlers.RegisterBuildWorkspaces(api, svc.BuildWorkspace)
+	handlers.RegisterBuildWorkspaces(api, svc.BuildWorkspace, svc.Build)
 	handlers.RegisterImageUpdates(api, svc.ImageUpdate, svc.Image, handlerAppCtx)
 	handlers.RegisterSettings(api, svc.Settings, svc.SettingsSearch, svc.Environment, cfg)
 	handlers.RegisterJobSchedules(api, svc.JobSchedule, svc.Environment)

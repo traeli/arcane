@@ -9,10 +9,13 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/models"
 	buildgit "github.com/getarcaneapp/arcane/backend/v2/pkg/gitutil"
+	gitlib "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	sqlite "github.com/libtnb/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -281,6 +284,119 @@ func TestBuildService_BuildImage_PreservesRemoteSourceInHistory(t *testing.T) {
 	var record models.ImageBuild
 	require.NoError(t, db.WithContext(context.Background()).First(&record).Error)
 	assert.Equal(t, req.ContextDir, record.ContextDir)
+}
+
+func TestBuildService_QuickBuildUsesLocalCommitWithoutPull(t *testing.T) {
+	db, err := setupBuildHistoryTestDB()
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&models.ContainerRegistry{}))
+
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "order-service")
+	repository, err := gitlib.PlainInit(repoPath, false)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(repoPath, "Dockerfile"), []byte("FROM scratch\n"), 0o644))
+	worktree, err := repository.Worktree()
+	require.NoError(t, err)
+	_, err = worktree.Add("Dockerfile")
+	require.NoError(t, err)
+	revision, err := worktree.Commit("initial", &gitlib.CommitOptions{Author: &object.Signature{
+		Name: "Arcane", Email: "test@example.com", When: time.Now(),
+	}})
+	require.NoError(t, err)
+
+	registry := &models.ContainerRegistry{
+		BaseModel:    models.BaseModel{ID: "registry-1"},
+		URL:          "registry.example.com",
+		Enabled:      true,
+		RegistryType: registryTypeGeneric,
+	}
+	require.NoError(t, db.Create(registry).Error)
+
+	settings := &SettingsService{}
+	settingsConfig := DefaultSettingsConfig()
+	settingsConfig.BuildsDirectory.Value = root
+	settings.config.Store(settingsConfig)
+
+	captured := buildtypes.BuildRequest{}
+	svc := &BuildService{
+		db:              db,
+		settings:        settings,
+		registryService: NewContainerRegistryService(db, nil, nil),
+		gitRepository:   NewGitRepositoryService(db, root, nil, settings),
+		builder: testBuildRecorder{onBuild: func(req buildtypes.BuildRequest) {
+			captured = req
+		}},
+		busyWorkspaces: make(map[string]struct{}),
+	}
+
+	var progress bytes.Buffer
+	_, err = svc.BuildImageWithSourceUpdate(context.Background(), "0", buildtypes.BuildRequest{
+		ContextDir: repoPath,
+		Push:       true,
+		Load:       false,
+		Provider:   "local",
+	}, SourceBuildOptions{Mode: SourceUpdateQuickBuild, RegistryID: registry.ID}, &progress, "quick", nil)
+	require.NoError(t, err)
+	assert.Contains(t, progress.String(), "reading local Git commit")
+	assert.NotContains(t, progress.String(), "checking Git workspace")
+	assert.NotContains(t, progress.String(), "source updated")
+	gitInfo, err := svc.InspectWorkspaceSource(context.Background(), repoPath)
+	require.NoError(t, err)
+	assert.True(t, gitInfo.IsGitRepository)
+	assert.Equal(t, revision.String()[:12], gitInfo.SuggestedTag)
+
+	resolvedRepoPath, err := filepath.EvalSymlinks(repoPath)
+	require.NoError(t, err)
+	assert.Equal(t, resolvedRepoPath, captured.ContextDir)
+	assert.Equal(t, "Dockerfile", captured.Dockerfile)
+	assert.Equal(t, "local", captured.Provider)
+	assert.True(t, captured.Push)
+	assert.False(t, captured.Load)
+	require.Len(t, captured.Tags, 1)
+	assert.Equal(t, "registry.example.com/order-service:"+revision.String()[:12], captured.Tags[0])
+
+	var buildRecord models.ImageBuild
+	require.NoError(t, db.First(&buildRecord).Error)
+	assert.Equal(t, "Dockerfile", buildRecord.Dockerfile)
+	assert.Equal(t, "local", buildRecord.Provider)
+	assert.Equal(t, models.StringSlice(captured.Tags), buildRecord.Tags)
+	assert.Equal(t, string(SourceUpdateQuickBuild), buildRecord.SourceUpdateMode)
+	require.NotNil(t, buildRecord.SourceRevision)
+	assert.Equal(t, revision.String(), *buildRecord.SourceRevision)
+
+	plainPath := filepath.Join(root, "plain-service")
+	require.NoError(t, os.MkdirAll(plainPath, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(plainPath, "Dockerfile"), []byte("FROM scratch\n"), 0o644))
+	progress.Reset()
+	_, err = svc.BuildImageWithSourceUpdate(context.Background(), "0", buildtypes.BuildRequest{
+		ContextDir: plainPath,
+		Tags:       []string{"manual-v1"},
+		Push:       true,
+		Provider:   "local",
+	}, SourceBuildOptions{Mode: SourceUpdateQuickBuild, RegistryID: registry.ID}, &progress, "quick", nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"registry.example.com/plain-service:manual-v1"}, captured.Tags)
+	assert.NotContains(t, progress.String(), "Git")
+	plainInfo, err := svc.InspectWorkspaceSource(context.Background(), plainPath)
+	require.NoError(t, err)
+	assert.False(t, plainInfo.IsGitRepository)
+	assert.Empty(t, plainInfo.SuggestedTag)
+}
+
+func TestBuildService_QuickBuildRequiresDirectChildWithDockerfile(t *testing.T) {
+	root := t.TempDir()
+	settings := &SettingsService{}
+	settingsConfig := DefaultSettingsConfig()
+	settingsConfig.BuildsDirectory.Value = root
+	settings.config.Store(settingsConfig)
+
+	svc := &BuildService{settings: settings}
+	nested := filepath.Join(root, "team", "service")
+	require.NoError(t, os.MkdirAll(nested, 0o755))
+
+	_, err := svc.resolveWorkspaceDirectoryInternal(context.Background(), nested, true)
+	require.ErrorContains(t, err, "direct child")
 }
 
 func TestBuildService_BuildImage_FailureRecordsHistoryAndEvent(t *testing.T) {

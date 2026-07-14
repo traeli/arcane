@@ -17,12 +17,33 @@ import (
 
 // BuildWorkspaceHandler provides file browsing endpoints for manual build workspaces.
 type BuildWorkspaceHandler struct {
-	service *services.BuildWorkspaceService
+	service      *services.BuildWorkspaceService
+	buildService *services.BuildService
 }
 
 // RegisterBuildWorkspaces registers build workspace file browser routes.
-func RegisterBuildWorkspaces(api huma.API, workspaceService *services.BuildWorkspaceService) {
-	h := &BuildWorkspaceHandler{service: workspaceService}
+func RegisterBuildWorkspaces(api huma.API, workspaceService *services.BuildWorkspaceService, buildService *services.BuildService) {
+	h := &BuildWorkspaceHandler{service: workspaceService, buildService: buildService}
+
+	humamw.RegisterWithPermission(api, huma.Operation{
+		OperationID: "builds-source-info",
+		Method:      "GET",
+		Path:        "/environments/{id}/builds/source-info",
+		Summary:     "Inspect a build workspace source",
+		Description: "Report whether a direct build workspace child is a Git repository and return its local commit tag",
+		Tags:        []string{"Builds"},
+		Security:    []map[string][]string{{"BearerAuth": {}}, {"ApiKeyAuth": {}}},
+	}, authz.PermBuildWorkspacesManage, h.GetWorkspaceSourceInfo)
+
+	humamw.RegisterWithPermission(api, huma.Operation{
+		OperationID: "builds-git-update",
+		Method:      "POST",
+		Path:        "/environments/{id}/builds/git-update",
+		Summary:     "Update a Git build workspace",
+		Description: "Pull and prune the configured upstream for a direct child of the builds workspace",
+		Tags:        []string{"Builds"},
+		Security:    []map[string][]string{{"BearerAuth": {}}, {"ApiKeyAuth": {}}},
+	}, authz.PermBuildWorkspacesManage, h.UpdateGitWorkspace)
 
 	humamw.RegisterWithPermission(api, huma.Operation{
 		OperationID: "builds-browse",
@@ -107,6 +128,26 @@ type BrowseBuildsInput struct {
 	Path          string `query:"path" default:"/" doc:"Directory path to browse"`
 }
 
+type UpdateBuildGitInput struct {
+	EnvironmentID string `path:"id" doc:"Environment ID"`
+	Body          struct {
+		ContextDir string `json:"contextDir" doc:"Absolute direct child directory inside the builds workspace"`
+	}
+}
+
+type UpdateBuildGitOutput struct {
+	Body base.ApiResponse[services.WorkspaceGitUpdate]
+}
+
+type GetWorkspaceSourceInfoInput struct {
+	EnvironmentID string `path:"id" doc:"Environment ID"`
+	ContextDir    string `query:"contextDir" doc:"Absolute direct child directory inside the builds workspace"`
+}
+
+type GetWorkspaceSourceInfoOutput struct {
+	Body base.ApiResponse[services.WorkspaceSourceInfo]
+}
+
 type BrowseBuildsOutput struct {
 	Body base.ApiResponse[[]volumetypes.FileEntry]
 }
@@ -163,6 +204,28 @@ func (h *BuildWorkspaceHandler) BrowseDirectory(ctx context.Context, input *Brow
 		return nil, huma.Error500InternalServerError(err.Error())
 	}
 	return &BrowseBuildsOutput{Body: base.ApiResponse[[]volumetypes.FileEntry]{Success: true, Data: entries}}, nil
+}
+
+func (h *BuildWorkspaceHandler) UpdateGitWorkspace(ctx context.Context, input *UpdateBuildGitInput) (*UpdateBuildGitOutput, error) {
+	if h.buildService == nil {
+		return nil, huma.Error500InternalServerError("service not available")
+	}
+	result, err := h.buildService.UpdateWorkspaceGit(ctx, input.Body.ContextDir)
+	if err != nil {
+		return nil, huma.Error400BadRequest(err.Error())
+	}
+	return &UpdateBuildGitOutput{Body: base.ApiResponse[services.WorkspaceGitUpdate]{Success: true, Data: *result}}, nil
+}
+
+func (h *BuildWorkspaceHandler) GetWorkspaceSourceInfo(ctx context.Context, input *GetWorkspaceSourceInfoInput) (*GetWorkspaceSourceInfoOutput, error) {
+	if h.buildService == nil {
+		return nil, huma.Error500InternalServerError("service not available")
+	}
+	result, err := h.buildService.InspectWorkspaceSource(ctx, input.ContextDir)
+	if err != nil {
+		return nil, huma.Error400BadRequest(err.Error())
+	}
+	return &GetWorkspaceSourceInfoOutput{Body: base.ApiResponse[services.WorkspaceSourceInfo]{Success: true, Data: *result}}, nil
 }
 
 func (h *BuildWorkspaceHandler) GetFileContent(ctx context.Context, input *GetBuildFileContentInput) (*GetBuildFileContentOutput, error) {

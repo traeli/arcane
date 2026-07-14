@@ -383,6 +383,37 @@ func (c *Client) IsRepository(ctx context.Context, repoPath string) (bool, error
 	return false, fmt.Errorf("failed to inspect repository: %w", err)
 }
 
+// GetWorktreeRemoteURL returns the first URL configured for the current
+// branch's upstream remote.
+func (c *Client) GetWorktreeRemoteURL(ctx context.Context, repoPath string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	repo, err := git.PlainOpen(repoPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open repository: %w", err)
+	}
+	head, err := repo.Head()
+	if err != nil {
+		return "", fmt.Errorf("failed to get HEAD: %w", err)
+	}
+	if !head.Name().IsBranch() {
+		return "", errors.New("git worktree has a detached HEAD")
+	}
+	branch, err := repo.Branch(head.Name().Short())
+	if err != nil || branch.Remote == "" {
+		return "", errors.New("current git branch has no upstream")
+	}
+	remote, err := repo.Remote(branch.Remote)
+	if err != nil {
+		return "", fmt.Errorf("failed to read git upstream: %w", err)
+	}
+	if len(remote.Config().URLs) == 0 {
+		return "", errors.New("git upstream has no URL")
+	}
+	return remote.Config().URLs[0], nil
+}
+
 // UpdateWorktreeFastForward validates a clean branch worktree and pulls its
 // configured upstream without creating a merge commit.
 func (c *Client) UpdateWorktreeFastForward(ctx context.Context, repoPath string, authConfig AuthConfig) (*WorktreeUpdate, error) {
@@ -436,6 +467,16 @@ func (c *Client) UpdateWorktreeFastForward(ctx context.Context, repoPath string,
 		return nil, err
 	}
 	before := head.Hash().String()
+	// Match `git pull --prune` semantics before fast-forwarding the checked-out
+	// branch. PullOptions does not expose prune, so prune stale remote-tracking
+	// refs with an authenticated fetch first.
+	err = remote.FetchContext(ctx, &git.FetchOptions{
+		Auth:  auth,
+		Prune: true,
+	})
+	if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+		return nil, fmt.Errorf("failed to prune and fetch git upstream: %w", err)
+	}
 	err = worktree.PullContext(ctx, &git.PullOptions{
 		RemoteName:    branch.Remote,
 		ReferenceName: branch.Merge,

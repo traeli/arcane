@@ -8,11 +8,16 @@ async function login(page: Page): Promise<string> {
 	await page.getByLabel('Username').fill('arcane');
 
 	for (const password of [DEFAULT_PASSWORD, TEST_PASSWORD]) {
-		await page.getByLabel('Password').fill(password);
+		await page.getByLabel('Password', { exact: true }).fill(password);
 		await page.getByRole('button', { name: 'Sign in to Arcane', exact: true }).click();
 
 		try {
-			await page.waitForURL('/dashboard', { timeout: 5000 });
+			await Promise.race([
+				page.waitForURL(/\/dashboard(?:\?|$)/, { timeout: 5000 }),
+				page
+					.getByRole('dialog', { name: 'Change Default Password' })
+					.waitFor({ state: 'visible', timeout: 5000 })
+			]);
 			return password;
 		} catch {
 			const invalidCredentialsAlert = page

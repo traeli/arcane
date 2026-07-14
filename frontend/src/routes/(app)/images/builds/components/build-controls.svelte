@@ -11,16 +11,12 @@
 		inputs,
 		providerOptions,
 		isBuilding = false,
-		onBuild,
-		onGitBuild,
-		canGitBuild = false
+		onBuild
 	}: {
 		inputs: BuildFormInputsStore;
 		providerOptions: BuildProviderOption[];
 		isBuilding?: boolean;
 		onBuild?: () => void;
-		onGitBuild?: () => void;
-		canGitBuild?: boolean;
 	} = $props();
 </script>
 
@@ -53,15 +49,6 @@
 	</div>
 
 	<IfPermitted perm="images:build">
-		<ArcaneButton
-			action="base"
-			type="button"
-			size="sm"
-			tone="outline"
-			customLabel={m.build_git_update_and_build()}
-			onclick={() => onGitBuild?.()}
-			disabled={!canGitBuild || isBuilding}
-		/>
 		<ArcaneButton
 			action="start_all"
 			type="button"

@@ -35,7 +35,13 @@
 		onValueChange?: (value: string) => void;
 	} = $props();
 
+	let open = $state(false);
 	const selectedLabel = $derived(options.find((o) => o.value === value)?.label ?? placeholder);
+
+	function handleValueChange(nextValue: string) {
+		open = false;
+		onValueChange?.(nextValue);
+	}
 </script>
 
 {#snippet optionItems()}
@@ -67,7 +73,7 @@
 		</div>
 	{/if}
 
-	<Select.Root type="single" bind:value {name} {disabled} onValueChange={(v) => onValueChange?.(v)}>
+	<Select.Root type="single" bind:open bind:value {name} {disabled} onValueChange={handleValueChange}>
 		<Select.Trigger size={triggerSize} class="{triggerClass} {error ? 'border-destructive' : ''}" {id}>
 			<span class="min-w-0 flex-1 truncate text-left" title={selectedLabel}>{selectedLabel}</span>
 		</Select.Trigger>

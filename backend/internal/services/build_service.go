@@ -46,14 +46,28 @@ type BuildService struct {
 type SourceUpdateMode string
 
 const (
-	SourceUpdateNone    SourceUpdateMode = "none"
-	SourceUpdateGitPull SourceUpdateMode = "git-pull"
+	SourceUpdateNone       SourceUpdateMode = "none"
+	SourceUpdateGitPull    SourceUpdateMode = "git-pull"
+	SourceUpdateQuickBuild SourceUpdateMode = "quick-build"
 )
 
 type SourceBuildOptions struct {
 	Mode           SourceUpdateMode
 	RegistryID     string
 	RepositoryName string
+}
+
+type WorkspaceGitUpdate struct {
+	Updated      bool   `json:"updated"`
+	Branch       string `json:"branch"`
+	BeforeCommit string `json:"beforeCommit"`
+	AfterCommit  string `json:"afterCommit"`
+}
+
+type WorkspaceSourceInfo struct {
+	IsGitRepository bool   `json:"isGitRepository"`
+	Revision        string `json:"revision,omitempty"`
+	SuggestedTag    string `json:"suggestedTag,omitempty"`
 }
 
 const buildHistoryOutputLimitBytes = 2 * 1024 * 1024
@@ -142,8 +156,8 @@ func (s *BuildService) buildImageInternal(ctx context.Context, environmentID str
 	resolvedReq := req
 	var sourceMetadata *buildgit.WorktreeUpdate
 	var unlockWorkspace func()
-	if sourceOptions.Mode == SourceUpdateGitPull {
-		resolvedReq, sourceMetadata, unlockWorkspace, err = s.prepareGitSourceBuildInternal(ctx, req, sourceOptions, writer, serviceName)
+	if sourceOptions.Mode == SourceUpdateGitPull || sourceOptions.Mode == SourceUpdateQuickBuild {
+		resolvedReq, sourceMetadata, unlockWorkspace, err = s.prepareWorkspaceSourceBuildInternal(ctx, req, sourceOptions, writer, serviceName)
 	} else if sourceOptions.Mode == SourceUpdateNone || sourceOptions.Mode == "" {
 		unlockWorkspace, err = s.lockOrdinaryLocalBuildInternal(ctx, req)
 	} else {
@@ -160,7 +174,7 @@ func (s *BuildService) buildImageInternal(ctx context.Context, environmentID str
 	} else {
 		cleanupResolvedContext = cleanupFn
 		resolvedReq = nextReq
-		if buildRecordID != "" && sourceOptions.Mode == SourceUpdateGitPull {
+		if buildRecordID != "" && (sourceOptions.Mode == SourceUpdateGitPull || sourceOptions.Mode == SourceUpdateQuickBuild) {
 			if updateErr := s.updateBuildSourceInternal(ctx, buildRecordID, resolvedReq, sourceOptions.Mode, sourceMetadata); updateErr != nil {
 				err = updateErr
 			} else {
@@ -299,41 +313,21 @@ func firstNonEmptyStringInternal(values ...string) string {
 	return ""
 }
 
-func (s *BuildService) prepareGitSourceBuildInternal(ctx context.Context, req buildtypes.BuildRequest, options SourceBuildOptions, progressWriter io.Writer, serviceName string) (buildtypes.BuildRequest, *buildgit.WorktreeUpdate, func(), error) {
+func (s *BuildService) prepareWorkspaceSourceBuildInternal(ctx context.Context, req buildtypes.BuildRequest, options SourceBuildOptions, progressWriter io.Writer, serviceName string) (buildtypes.BuildRequest, *buildgit.WorktreeUpdate, func(), error) {
 	noop := func() {}
-	if options.Mode != SourceUpdateGitPull {
+	if options.Mode != SourceUpdateGitPull && options.Mode != SourceUpdateQuickBuild {
 		return req, nil, noop, fmt.Errorf("unsupported source update mode %q", options.Mode)
 	}
 	if s.effectiveBuildProviderInternal(req.Provider) != "local" {
-		return req, nil, noop, errors.New("git source updates are only supported by the local build provider")
+		return req, nil, noop, errors.New("workspace source builds are only supported by the local build provider")
 	}
-	if s.settings == nil || s.registryService == nil || s.gitRepository == nil || s.gitRepository.gitClient == nil {
-		return req, nil, noop, errors.New("git source build dependencies are not available")
+	if s.settings == nil || s.registryService == nil {
+		return req, nil, noop, errors.New("workspace source build dependencies are not available")
 	}
 
-	root, err := filepath.Abs(s.settings.GetStringSetting(ctx, "buildsDirectory", "/builds"))
+	contextPath, err := s.resolveWorkspaceDirectoryInternal(ctx, req.ContextDir, options.Mode == SourceUpdateQuickBuild)
 	if err != nil {
-		return req, nil, noop, fmt.Errorf("failed to resolve builds directory: %w", err)
-	}
-	root, err = filepath.EvalSymlinks(filepath.Clean(root))
-	if err != nil {
-		return req, nil, noop, fmt.Errorf("failed to resolve builds directory: %w", err)
-	}
-	contextPath, err := filepath.Abs(filepath.Clean(req.ContextDir))
-	if err != nil {
-		return req, nil, noop, fmt.Errorf("failed to resolve build context: %w", err)
-	}
-	contextPath, err = filepath.EvalSymlinks(contextPath)
-	if err != nil {
-		return req, nil, noop, fmt.Errorf("failed to resolve build context: %w", err)
-	}
-	rel, err := filepath.Rel(root, contextPath)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return req, nil, noop, errors.New("git build context must be a source directory inside the configured builds directory")
-	}
-	info, err := os.Stat(contextPath)
-	if err != nil || !info.IsDir() {
-		return req, nil, noop, errors.New("git build context is not a directory")
+		return req, nil, noop, err
 	}
 
 	if !s.tryLockWorkspaceInternal(contextPath) {
@@ -341,24 +335,90 @@ func (s *BuildService) prepareGitSourceBuildInternal(ctx context.Context, req bu
 	}
 	unlock := func() { s.unlockWorkspaceInternal(contextPath) }
 
-	registryID := strings.TrimSpace(options.RegistryID)
 	repositoryName := strings.TrimSpace(options.RepositoryName)
-	if registryID == "" || repositoryName == "" {
-		unlock()
-		return req, nil, noop, errors.New("an enabled registry and configured repository are required")
+	if options.Mode == SourceUpdateQuickBuild {
+		repositoryName = filepath.Base(contextPath)
 	}
-	registry, err := s.registryService.GetRegistryByID(ctx, registryID)
-	if err != nil {
+	if _, err := ref.ParseNormalizedNamed(repositoryName + ":latest"); err != nil || strings.Contains(repositoryName, "/") {
 		unlock()
-		return req, nil, noop, fmt.Errorf("failed to load target registry: %w", err)
+		return req, nil, noop, errors.New("build directory name is not a valid lowercase image repository name")
 	}
-	if !registry.Enabled {
-		unlock()
-		return req, nil, noop, errors.New("target registry is disabled")
+
+	var registryPrefix string
+	if req.Push {
+		registryID := strings.TrimSpace(options.RegistryID)
+		if registryID == "" {
+			unlock()
+			return req, nil, noop, errors.New("an enabled target registry is required when push is enabled")
+		}
+		registry, registryErr := s.registryService.GetRegistryByID(ctx, registryID)
+		if registryErr != nil {
+			unlock()
+			return req, nil, noop, fmt.Errorf("failed to load target registry: %w", registryErr)
+		}
+		if !registry.Enabled {
+			unlock()
+			return req, nil, noop, errors.New("target registry is disabled")
+		}
+		if options.Mode == SourceUpdateGitPull && !slices.Contains([]string(registry.RepositoryNames), repositoryName) {
+			unlock()
+			return req, nil, noop, errors.New("target repository is not configured for this registry")
+		}
+		registryPrefix = utilsregistry.NormalizeRegistryURL(registry.URL)
 	}
-	if !slices.Contains([]string(registry.RepositoryNames), repositoryName) {
+	if options.Mode == SourceUpdateQuickBuild {
+		dockerfilePath := filepath.Join(contextPath, "Dockerfile")
+		info, statErr := os.Stat(dockerfilePath)
+		if statErr != nil || !info.Mode().IsRegular() {
+			unlock()
+			return req, nil, noop, errors.New("selected build directory does not contain a Dockerfile")
+		}
+		if s.gitRepository == nil || s.gitRepository.gitClient == nil {
+			unlock()
+			return req, nil, noop, errors.New("local Git metadata reader is not available")
+		}
+		tag := strings.TrimSpace(firstNonEmptyStringInternal(req.Tags...))
+		isRepository, repositoryErr := s.gitRepository.gitClient.IsRepository(ctx, contextPath)
+		if repositoryErr != nil {
+			unlock()
+			return req, nil, noop, repositoryErr
+		}
+		var source *buildgit.WorktreeUpdate
+		if isRepository {
+			writeBuildProgressStatusInternal(progressWriter, serviceName, "reading local Git commit")
+			revision, revisionErr := s.gitRepository.gitClient.GetCurrentCommit(ctx, contextPath)
+			if revisionErr != nil {
+				unlock()
+				return req, nil, noop, fmt.Errorf("failed to read local Git commit: %w", revisionErr)
+			}
+			if len(revision) < 12 {
+				unlock()
+				return req, nil, noop, errors.New("local Git commit is invalid")
+			}
+			tag = strings.ToLower(revision[:12])
+			source = &buildgit.WorktreeUpdate{Revision: revision}
+		} else if tag == "" {
+			unlock()
+			return req, nil, noop, errors.New("an image tag is required when the selected build directory is not a Git repository")
+		}
+		imageReference := repositoryName + ":" + tag
+		if req.Push {
+			imageReference = registryPrefix + "/" + imageReference
+		}
+		if _, err := ref.ParseNormalizedNamed(imageReference); err != nil {
+			unlock()
+			return req, nil, noop, fmt.Errorf("generated image reference is invalid: %w", err)
+		}
+		req.ContextDir = contextPath
+		req.Dockerfile = "Dockerfile"
+		req.Provider = "local"
+		req.Tags = []string{imageReference}
+		return req, source, unlock, nil
+	}
+
+	if s.gitRepository == nil || s.gitRepository.gitClient == nil {
 		unlock()
-		return req, nil, noop, errors.New("target repository is not configured for this registry")
+		return req, nil, noop, errors.New("git source build dependencies are not available")
 	}
 
 	writeBuildProgressStatusInternal(progressWriter, serviceName, "checking Git workspace")
@@ -369,7 +429,6 @@ func (s *BuildService) prepareGitSourceBuildInternal(ctx context.Context, req bu
 	}
 	if !isRepository {
 		writeBuildProgressStatusInternal(progressWriter, serviceName, "no Git repository found; continuing without source update")
-		registryPrefix := utilsregistry.NormalizeRegistryURL(registry.URL)
 		imageReference := registryPrefix + "/" + repositoryName + ":latest"
 		if _, err := ref.ParseNormalizedNamed(imageReference); err != nil {
 			unlock()
@@ -381,7 +440,12 @@ func (s *BuildService) prepareGitSourceBuildInternal(ctx context.Context, req bu
 		req.Load = false
 		return req, nil, unlock, nil
 	}
-	update, err := s.gitRepository.gitClient.UpdateWorktreeFastForward(ctx, contextPath, buildgit.AuthConfig{})
+	authConfig, authErr := s.resolveWorkspaceGitAuthInternal(ctx, contextPath)
+	if authErr != nil {
+		unlock()
+		return req, nil, noop, authErr
+	}
+	update, err := s.gitRepository.gitClient.UpdateWorktreeFastForward(ctx, contextPath, authConfig)
 	if err != nil {
 		unlock()
 		return req, nil, noop, err
@@ -397,17 +461,123 @@ func (s *BuildService) prepareGitSourceBuildInternal(ctx context.Context, req bu
 	writeBuildProgressStatusInternal(progressWriter, serviceName, status)
 	writeBuildProgressStatusInternal(progressWriter, serviceName, "resolved revision "+update.Revision[:12])
 
-	registryPrefix := utilsregistry.NormalizeRegistryURL(registry.URL)
-	imageReference := registryPrefix + "/" + repositoryName + ":sha-" + strings.ToLower(update.Revision[:12])
+	tag := "sha-" + strings.ToLower(update.Revision[:12])
+	imageReference := repositoryName + ":" + tag
+	if req.Push {
+		imageReference = registryPrefix + "/" + imageReference
+	}
 	if _, err := ref.ParseNormalizedNamed(imageReference); err != nil {
 		unlock()
 		return req, nil, noop, fmt.Errorf("generated image reference is invalid: %w", err)
 	}
 	req.ContextDir = contextPath
 	req.Tags = []string{imageReference}
-	req.Push = true
-	req.Load = false
 	return req, update, unlock, nil
+}
+
+func (s *BuildService) InspectWorkspaceSource(ctx context.Context, contextDir string) (*WorkspaceSourceInfo, error) {
+	if s.gitRepository == nil || s.gitRepository.gitClient == nil {
+		return nil, errors.New("local Git metadata reader is not available")
+	}
+	contextPath, err := s.resolveWorkspaceDirectoryInternal(ctx, contextDir, true)
+	if err != nil {
+		return nil, err
+	}
+	isRepository, err := s.gitRepository.gitClient.IsRepository(ctx, contextPath)
+	if err != nil || !isRepository {
+		return &WorkspaceSourceInfo{IsGitRepository: false}, err
+	}
+	revision, err := s.gitRepository.gitClient.GetCurrentCommit(ctx, contextPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read local Git commit: %w", err)
+	}
+	if len(revision) < 12 {
+		return nil, errors.New("local Git commit is invalid")
+	}
+	return &WorkspaceSourceInfo{IsGitRepository: true, Revision: revision, SuggestedTag: strings.ToLower(revision[:12])}, nil
+}
+
+func (s *BuildService) UpdateWorkspaceGit(ctx context.Context, contextDir string) (*WorkspaceGitUpdate, error) {
+	if s.gitRepository == nil || s.gitRepository.gitClient == nil {
+		return nil, errors.New("git repository service is not available")
+	}
+	contextPath, err := s.resolveWorkspaceDirectoryInternal(ctx, contextDir, true)
+	if err != nil {
+		return nil, err
+	}
+	if !s.tryLockWorkspaceInternal(contextPath) {
+		return nil, errors.New("this source directory is already being updated or built")
+	}
+	defer s.unlockWorkspaceInternal(contextPath)
+
+	isRepository, err := s.gitRepository.gitClient.IsRepository(ctx, contextPath)
+	if err != nil {
+		return nil, err
+	}
+	if !isRepository {
+		return nil, errors.New("selected build directory is not a Git repository")
+	}
+	before, err := s.gitRepository.gitClient.GetCurrentCommit(ctx, contextPath)
+	if err != nil {
+		return nil, err
+	}
+	authConfig, err := s.resolveWorkspaceGitAuthInternal(ctx, contextPath)
+	if err != nil {
+		return nil, err
+	}
+	update, err := s.gitRepository.gitClient.UpdateWorktreeFastForward(ctx, contextPath, authConfig)
+	if err != nil {
+		return nil, err
+	}
+	return &WorkspaceGitUpdate{
+		Updated:      update.Updated,
+		Branch:       update.Branch,
+		BeforeCommit: before,
+		AfterCommit:  update.Revision,
+	}, nil
+}
+
+func (s *BuildService) resolveWorkspaceGitAuthInternal(ctx context.Context, contextPath string) (buildgit.AuthConfig, error) {
+	remoteURL, err := s.gitRepository.gitClient.GetWorktreeRemoteURL(ctx, contextPath)
+	if err != nil {
+		return buildgit.AuthConfig{}, err
+	}
+	authConfig, _, err := s.resolveGitBuildAuthInternal(ctx, remoteURL)
+	return authConfig, err
+}
+
+func (s *BuildService) resolveWorkspaceDirectoryInternal(ctx context.Context, contextDir string, requireDirectChild bool) (string, error) {
+	if s.settings == nil {
+		return "", errors.New("settings service is not available")
+	}
+	root, err := filepath.Abs(s.settings.GetStringSetting(ctx, "buildsDirectory", "/builds"))
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve builds directory: %w", err)
+	}
+	root, err = filepath.EvalSymlinks(filepath.Clean(root))
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve builds directory: %w", err)
+	}
+	resolved, err := filepath.Abs(filepath.Clean(contextDir))
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve build context: %w", err)
+	}
+	resolved, err = filepath.EvalSymlinks(resolved)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve build context: %w", err)
+	}
+	rel, err := filepath.Rel(root, resolved)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errors.New("build context must be a source directory inside the configured builds directory")
+	}
+	if requireDirectChild && (filepath.Dir(rel) != "." || filepath.Base(rel) == ".") {
+		return "", errors.New("build context must be a direct child of the configured builds directory")
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return "", errors.New("build context is not a directory")
+	}
+	return resolved, nil
 }
 
 func (s *BuildService) tryLockWorkspaceInternal(path string) bool {
@@ -467,6 +637,9 @@ func (s *BuildService) unlockWorkspaceInternal(path string) {
 func (s *BuildService) updateBuildSourceInternal(ctx context.Context, buildID string, req buildtypes.BuildRequest, mode SourceUpdateMode, source *buildgit.WorktreeUpdate) error {
 	updates := map[string]any{
 		"tags":               models.StringSlice(req.Tags),
+		"context_dir":        req.ContextDir,
+		"dockerfile":         req.Dockerfile,
+		"provider":           req.Provider,
 		"push":               req.Push,
 		"load":               req.Load,
 		"source_update_mode": string(mode),
