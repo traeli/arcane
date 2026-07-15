@@ -4,7 +4,10 @@ ARG ARCANE_RUNTIME_BASE_IMAGE=ghcr.io/getarcaneapp/base:distroless
 
 # Stage 1: Build Frontend
 FROM --platform=$BUILDPLATFORM node:26-trixie-slim AS frontend-builder
-RUN npm install -g --force corepack@v0.34.5 && corepack enable
+ARG NPM_REGISTRY="https://registry.npmjs.org"
+RUN npm config set registry "${NPM_REGISTRY}" && \
+    npm install -g --force corepack@v0.34.5 && \
+    corepack enable
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 ENV CI=true
@@ -12,6 +15,13 @@ WORKDIR /build
 
 COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
 COPY frontend/package.json ./frontend/package.json
+
+RUN pnpm config set registry "${NPM_REGISTRY}" && \
+    pnpm config set fetch-retries 5 && \
+    pnpm config set fetch-retry-mintimeout 20000 && \
+    pnpm config set fetch-retry-maxtimeout 120000 && \
+    pnpm config set fetch-timeout 600000 && \
+    pnpm config set network-concurrency 4
 
 RUN --mount=type=cache,id=arcane-pnpm-v2,target=/pnpm/store,sharing=locked \
     pnpm fetch && \
@@ -33,9 +43,11 @@ FROM --platform=$BUILDPLATFORM golang:1.26.5-trixie AS backend-builder
 ARG TARGETARCH
 ARG TARGETVARIANT
 ARG BUILD_TAGS
+ARG GOPROXY="https://proxy.golang.org,direct"
 ARG VERSION="dev"
 ARG REVISION="unknown"
 ARG BUILD_TIME="unknown"
+ENV GOPROXY="${GOPROXY}"
 WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git tzdata jq \

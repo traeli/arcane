@@ -30,6 +30,9 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
     container_name: arcane
     restart: unless-stopped
     cgroup: host
