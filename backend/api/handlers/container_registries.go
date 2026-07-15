@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -96,7 +97,42 @@ type SyncContainerRegistriesInput struct {
 }
 
 type SyncContainerRegistriesOutput struct {
-	Body base.ApiResponse[base.MessageResponse]
+	Body base.ApiResponse[containerregistry.RegistrySyncResult]
+}
+
+type RegistryEnvironmentStatusInput struct {
+	EnvironmentID string `path:"environmentId"`
+}
+type RegistryEnvironmentStatusOutput struct {
+	Body base.ApiResponse[[]containerregistry.EnvironmentStatus]
+}
+type TestRegistryPullInput struct {
+	ID   string `path:"id"`
+	Body containerregistry.PullTestRequest
+}
+type TestRegistryPullOutput struct {
+	Body base.ApiResponse[containerregistry.PullTestResult]
+}
+type TestRemoteRegistryPullInput struct {
+	EnvironmentID string `path:"environmentId"`
+	ID            string `path:"id"`
+	Body          containerregistry.PullTestRequest
+}
+type TestRemoteRegistryPullOutput struct {
+	Body base.ApiResponse[containerregistry.PullTestResult]
+}
+type RegistryCatalogInput struct {
+	ID string `path:"id"`
+}
+type RegistryTagsInput struct {
+	ID         string `path:"id"`
+	Repository string `query:"repository"`
+}
+type RegistryRepositoriesOutput struct {
+	Body base.ApiResponse[containerregistry.RepositoryCatalog]
+}
+type RegistryTagsOutput struct {
+	Body base.ApiResponse[containerregistry.TagCatalog]
 }
 
 // ============================================================================
@@ -109,6 +145,48 @@ func RegisterContainerRegistries(api huma.API, registryService *services.Contain
 		registryService:    registryService,
 		environmentService: environmentService,
 	}
+
+	huma.Register(api, huma.Operation{
+		OperationID: "listContainerRegistryRepositories", Method: http.MethodGet,
+		Path: "/container-registries/{id}/repositories", Summary: "List ECR repositories",
+		Tags: []string{"Container Registries"}, Security: defaultOperationSecurityInternal(),
+		Middlewares: humamw.RequirePermission(api, authz.PermRegistriesRead),
+	}, h.ListRepositories)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "listContainerRegistryTags", Method: http.MethodGet,
+		Path: "/container-registries/{id}/tags", Summary: "List ECR image tags",
+		Tags: []string{"Container Registries"}, Security: defaultOperationSecurityInternal(),
+		Middlewares: humamw.RequirePermission(api, authz.PermRegistriesRead),
+	}, h.ListTags)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "getContainerRegistryEnvironmentStatuses", Method: http.MethodGet,
+		Path: "/container-registries/environments/{environmentId}/status", Summary: "Get registry synchronization status for an environment",
+		Tags: []string{"Container Registries"}, Security: defaultOperationSecurityInternal(),
+		Middlewares: humamw.RequirePermission(api, authz.PermRegistriesRead),
+	}, h.GetEnvironmentStatuses)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "syncContainerRegistriesToEnvironment", Method: http.MethodPost,
+		Path: "/container-registries/environments/{environmentId}/sync", Summary: "Sync registries to one environment",
+		Tags: []string{"Container Registries"}, Security: defaultOperationSecurityInternal(),
+		Middlewares: humamw.RequirePermission(api, authz.PermRegistriesUpdate),
+	}, h.SyncEnvironment)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "testContainerRegistryPullOnEnvironment", Method: http.MethodPost,
+		Path: "/container-registries/{id}/environments/{environmentId}/test-pull", Summary: "Test pull access on one environment",
+		Tags: []string{"Container Registries"}, Security: defaultOperationSecurityInternal(),
+		Middlewares: humamw.RequirePermission(api, authz.PermRegistriesTest),
+	}, h.TestRemotePull)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "testLocalContainerRegistryPull", Method: http.MethodPost,
+		Path: "/container-registries/{id}/test-pull", Summary: "Test local pull access for an image manifest",
+		Tags: []string{"Container Registries"}, Security: defaultOperationSecurityInternal(),
+		Middlewares: humamw.RequirePermission(api, authz.PermRegistriesTest),
+	}, h.TestLocalPull)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "listContainerRegistries",
@@ -433,13 +511,67 @@ func (h *ContainerRegistryHandler) SyncRegistries(ctx context.Context, input *Sy
 	}
 
 	return &SyncContainerRegistriesOutput{
-		Body: base.ApiResponse[base.MessageResponse]{
+		Body: base.ApiResponse[containerregistry.RegistrySyncResult]{
 			Success: true,
-			Data: base.MessageResponse{
-				Message: "Registries synced successfully",
-			},
+			Data:    containerregistry.RegistrySyncResult{Message: "Registries synced successfully", AppliedVersion: input.Body.Version},
 		},
 	}, nil
+}
+
+func (h *ContainerRegistryHandler) GetEnvironmentStatuses(ctx context.Context, input *RegistryEnvironmentStatusInput) (*RegistryEnvironmentStatusOutput, error) {
+	rows, err := h.environmentService.GetRegistryEnvironmentStatuses(ctx, input.EnvironmentID)
+	if err != nil {
+		return nil, huma.Error500InternalServerError(err.Error())
+	}
+	out := make([]containerregistry.EnvironmentStatus, 0, len(rows))
+	for i := range rows {
+		out = append(out, containerregistry.EnvironmentStatus{
+			RegistryID: rows[i].RegistryID, EnvironmentID: rows[i].EnvironmentID, DesiredVersion: rows[i].DesiredVersion,
+			AppliedVersion: rows[i].AppliedVersion, SyncStatus: rows[i].SyncStatus, LastSyncAt: rows[i].LastSyncAt,
+			LastSyncError: rows[i].LastSyncError, PullTestStatus: rows[i].PullTestStatus,
+			LastPullTestAt: rows[i].LastPullTestAt, LastPullTestError: rows[i].LastPullTestError,
+		})
+	}
+	return &RegistryEnvironmentStatusOutput{Body: base.ApiResponse[[]containerregistry.EnvironmentStatus]{Success: true, Data: out}}, nil
+}
+
+func (h *ContainerRegistryHandler) SyncEnvironment(ctx context.Context, input *RegistryEnvironmentStatusInput) (*SyncContainerRegistriesOutput, error) {
+	if err := h.environmentService.SyncRegistriesToEnvironment(ctx, input.EnvironmentID); err != nil {
+		return nil, huma.Error502BadGateway(err.Error())
+	}
+	return &SyncContainerRegistriesOutput{Body: base.ApiResponse[containerregistry.RegistrySyncResult]{Success: true, Data: containerregistry.RegistrySyncResult{Message: "Registries synced successfully"}}}, nil
+}
+
+func (h *ContainerRegistryHandler) TestLocalPull(ctx context.Context, input *TestRegistryPullInput) (*TestRegistryPullOutput, error) {
+	result, err := h.registryService.TestPullAccess(ctx, input.ID, input.Body.Repository, input.Body.Tag)
+	if err != nil {
+		return nil, huma.Error400BadRequest(err.Error())
+	}
+	return &TestRegistryPullOutput{Body: base.ApiResponse[containerregistry.PullTestResult]{Success: true, Data: result}}, nil
+}
+
+func (h *ContainerRegistryHandler) TestRemotePull(ctx context.Context, input *TestRemoteRegistryPullInput) (*TestRemoteRegistryPullOutput, error) {
+	result, err := h.environmentService.TestRegistryPullAccess(ctx, input.EnvironmentID, input.ID, input.Body)
+	if err != nil {
+		return nil, huma.Error400BadRequest(err.Error())
+	}
+	return &TestRemoteRegistryPullOutput{Body: base.ApiResponse[containerregistry.PullTestResult]{Success: true, Data: result}}, nil
+}
+
+func (h *ContainerRegistryHandler) ListRepositories(ctx context.Context, input *RegistryCatalogInput) (*RegistryRepositoriesOutput, error) {
+	values, err := h.registryService.ListECRRepositories(ctx, input.ID)
+	if err != nil {
+		return nil, huma.Error400BadRequest(err.Error())
+	}
+	return &RegistryRepositoriesOutput{Body: base.ApiResponse[containerregistry.RepositoryCatalog]{Success: true, Data: containerregistry.RepositoryCatalog{Repositories: values}}}, nil
+}
+
+func (h *ContainerRegistryHandler) ListTags(ctx context.Context, input *RegistryTagsInput) (*RegistryTagsOutput, error) {
+	values, err := h.registryService.ListECRTags(ctx, input.ID, strings.TrimSpace(input.Repository))
+	if err != nil {
+		return nil, huma.Error400BadRequest(err.Error())
+	}
+	return &RegistryTagsOutput{Body: base.ApiResponse[containerregistry.TagCatalog]{Success: true, Data: containerregistry.TagCatalog{Repository: input.Repository, Tags: values}}}, nil
 }
 
 // ============================================================================

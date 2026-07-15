@@ -57,6 +57,41 @@ func (s *ContainerRegistryService) GetOrRefreshECRToken(ctx context.Context, reg
 }
 
 func (s *ContainerRegistryService) refreshECRTokenInternal(ctx context.Context, reg *models.ContainerRegistry) (*ecrTokenResult, error) {
+	ecrClient, clientErr := s.ecrClientForRegistryInternal(ctx, reg)
+	if clientErr != nil {
+		return nil, clientErr
+	}
+	result, ecrErr := ecrClient.GetAuthorizationToken(ctx, &ecr.GetAuthorizationTokenInput{})
+	if ecrErr != nil {
+		return nil, fmt.Errorf("failed to get ECR authorization token for registry %s: %w", reg.URL, ecrErr)
+	}
+	if len(result.AuthorizationData) == 0 || result.AuthorizationData[0].AuthorizationToken == nil {
+		return nil, fmt.Errorf("ECR returned empty authorization data for registry %s", reg.URL)
+	}
+
+	decoded, decodeErr := base64.StdEncoding.DecodeString(*result.AuthorizationData[0].AuthorizationToken)
+	if decodeErr != nil {
+		return nil, fmt.Errorf("failed to decode ECR token for registry %s: %w", reg.URL, decodeErr)
+	}
+	parts := strings.SplitN(string(decoded), ":", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return nil, fmt.Errorf("unexpected ECR token format for registry %s", reg.URL)
+	}
+	ecrPassword := parts[1]
+	encryptedToken, encErr := crypto.Encrypt(ecrPassword)
+	if encErr != nil {
+		return nil, fmt.Errorf("failed to encrypt ECR token for registry %s: %w", reg.URL, encErr)
+	}
+	now := time.Now().UTC()
+	reg.ECRToken = encryptedToken
+	reg.ECRTokenGeneratedAt = &now
+	if saveErr := s.db.WithContext(ctx).Model(reg).Updates(map[string]any{"ecr_token": encryptedToken, "ecr_token_generated_at": now}).Error; saveErr != nil {
+		slog.WarnContext(ctx, "failed to persist ECR token to database", "registry", reg.URL, "error", saveErr)
+	}
+	return &ecrTokenResult{username: "AWS", password: ecrPassword}, nil
+}
+
+func (s *ContainerRegistryService) ecrClientForRegistryInternal(ctx context.Context, reg *models.ContainerRegistry) (*ecr.Client, error) {
 	// Decrypt the stored AWS secret access key.
 	secretKey, decErr := crypto.Decrypt(reg.AWSSecretAccessKey)
 	if decErr != nil {
@@ -80,41 +115,65 @@ func (s *ContainerRegistryService) refreshECRTokenInternal(ctx context.Context, 
 		return nil, fmt.Errorf("failed to load AWS config for registry %s: %w", reg.URL, cfgErr)
 	}
 
-	ecrClient := ecr.NewFromConfig(cfg)
-	result, ecrErr := ecrClient.GetAuthorizationToken(ctx, &ecr.GetAuthorizationTokenInput{})
-	if ecrErr != nil {
-		return nil, fmt.Errorf("failed to get ECR authorization token for registry %s: %w", reg.URL, ecrErr)
-	}
-	if len(result.AuthorizationData) == 0 || result.AuthorizationData[0].AuthorizationToken == nil {
-		return nil, fmt.Errorf("ECR returned empty authorization data for registry %s", reg.URL)
-	}
+	return ecr.NewFromConfig(cfg), nil
+}
 
-	// Decode base64 token → "AWS:<password>".
-	decoded, decodeErr := base64.StdEncoding.DecodeString(*result.AuthorizationData[0].AuthorizationToken)
-	if decodeErr != nil {
-		return nil, fmt.Errorf("failed to decode ECR token for registry %s: %w", reg.URL, decodeErr)
+func (s *ContainerRegistryService) ListECRRepositories(ctx context.Context, registryID string) ([]string, error) {
+	reg, err := s.GetRegistryByID(ctx, registryID)
+	if err != nil {
+		return nil, err
 	}
-	parts := strings.SplitN(string(decoded), ":", 2)
-	if len(parts) != 2 || parts[1] == "" {
-		return nil, fmt.Errorf("unexpected ECR token format for registry %s", reg.URL)
+	if reg.RegistryType != registryTypeECR {
+		return nil, fmt.Errorf("repository discovery is supported for ECR registries only")
 	}
-	ecrPassword := parts[1]
+	client, err := s.ecrClientForRegistryInternal(ctx, reg)
+	if err != nil {
+		return nil, err
+	}
+	var values []string
+	var token *string
+	for {
+		page, pageErr := client.DescribeRepositories(ctx, &ecr.DescribeRepositoriesInput{NextToken: token})
+		if pageErr != nil {
+			return nil, fmt.Errorf("describe ECR repositories: %w", pageErr)
+		}
+		for _, item := range page.Repositories {
+			if item.RepositoryName != nil {
+				values = append(values, *item.RepositoryName)
+			}
+		}
+		token = page.NextToken
+		if token == nil || *token == "" {
+			return values, nil
+		}
+	}
+}
 
-	// Persist the new token (encrypted) and generation timestamp.
-	encryptedToken, encErr := crypto.Encrypt(ecrPassword)
-	if encErr != nil {
-		return nil, fmt.Errorf("failed to encrypt ECR token for registry %s: %w", reg.URL, encErr)
+func (s *ContainerRegistryService) ListECRTags(ctx context.Context, registryID, repository string) ([]string, error) {
+	reg, err := s.GetRegistryByID(ctx, registryID)
+	if err != nil {
+		return nil, err
 	}
-	now := time.Now().UTC()
-	reg.ECRToken = encryptedToken
-	reg.ECRTokenGeneratedAt = &now
-	if saveErr := s.db.WithContext(ctx).Model(reg).Updates(map[string]any{
-		"ecr_token":              encryptedToken,
-		"ecr_token_generated_at": now,
-	}).Error; saveErr != nil {
-		// Non-fatal: log but continue — the token is still usable for this call.
-		slog.WarnContext(ctx, "failed to persist ECR token to database", "registry", reg.URL, "error", saveErr)
+	if reg.RegistryType != registryTypeECR {
+		return nil, fmt.Errorf("tag discovery is supported for ECR registries only")
 	}
-
-	return &ecrTokenResult{username: "AWS", password: ecrPassword}, nil
+	client, err := s.ecrClientForRegistryInternal(ctx, reg)
+	if err != nil {
+		return nil, err
+	}
+	var values []string
+	var token *string
+	for {
+		page, pageErr := client.DescribeImages(ctx, &ecr.DescribeImagesInput{RepositoryName: &repository, NextToken: token})
+		if pageErr != nil {
+			return nil, fmt.Errorf("describe ECR images: %w", pageErr)
+		}
+		for _, item := range page.ImageDetails {
+			values = append(values, item.ImageTags...)
+		}
+		token = page.NextToken
+		if token == nil || *token == "" {
+			return values, nil
+		}
+	}
 }

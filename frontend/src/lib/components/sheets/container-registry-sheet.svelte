@@ -42,7 +42,10 @@
 			enabled: z.boolean().default(true),
 			awsAccessKeyId: z.string().optional(),
 			awsSecretAccessKey: z.string().optional(),
-			awsRegion: z.string().optional()
+			awsRegion: z.string().optional(),
+			consumerAwsAccessKeyId: z.string().optional(),
+			consumerAwsSecretAccessKey: z.string().optional(),
+			consumerAwsRegion: z.string().optional()
 		})
 		.superRefine((data, ctx) => {
 			if (data.registryType === 'ecr') {
@@ -65,6 +68,13 @@
 						code: z.ZodIssueCode.custom,
 						message: m.registries_aws_secret_access_key_required(),
 						path: ['awsSecretAccessKey']
+					});
+				}
+				if (data.consumerAwsAccessKeyId?.trim() && !isEditMode && !data.consumerAwsSecretAccessKey?.trim()) {
+					ctx.addIssue({
+						code: z.ZodIssueCode.custom,
+						message: m.registries_consumer_secret_required(),
+						path: ['consumerAwsSecretAccessKey']
 					});
 				}
 			} else {
@@ -96,7 +106,10 @@
 		enabled: open && registryToEdit ? (registryToEdit.enabled ?? true) : true,
 		awsAccessKeyId: open && registryToEdit ? (registryToEdit.awsAccessKeyId ?? '') : '',
 		awsSecretAccessKey: '',
-		awsRegion: open && registryToEdit ? (registryToEdit.awsRegion ?? '') : ''
+		awsRegion: open && registryToEdit ? (registryToEdit.awsRegion ?? '') : '',
+		consumerAwsAccessKeyId: open && registryToEdit ? (registryToEdit.consumerAwsAccessKeyId ?? '') : '',
+		consumerAwsSecretAccessKey: '',
+		consumerAwsRegion: open && registryToEdit ? (registryToEdit.consumerAwsRegion ?? '') : ''
 	});
 
 	let { inputs, ...form } = $derived(createForm<typeof formSchema>(formSchema, formData));
@@ -176,6 +189,21 @@
 					type="text"
 					placeholder={m.registries_aws_region_placeholder()}
 					bind:input={$inputs.awsRegion}
+				/>
+				<div class="border-t pt-4 text-sm font-medium">{m.registries_consumer_credentials()}</div>
+				<p class="text-muted-foreground text-sm">{m.registries_consumer_credentials_description()}</p>
+				<FormInput label={m.registries_consumer_aws_access_key_id()} type="text" bind:input={$inputs.consumerAwsAccessKeyId} />
+				<FormInput
+					label={m.registries_consumer_aws_secret_access_key()}
+					type="password"
+					placeholder={isEditMode ? m.registries_token_keep_placeholder() : ''}
+					bind:input={$inputs.consumerAwsSecretAccessKey}
+				/>
+				<FormInput
+					label={m.registries_consumer_aws_region()}
+					type="text"
+					placeholder={m.registries_consumer_region_placeholder()}
+					bind:input={$inputs.consumerAwsRegion}
 				/>
 			{/if}
 

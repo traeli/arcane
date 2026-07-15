@@ -832,14 +832,19 @@ func (h *EnvironmentHandler) SyncEnvironment(ctx context.Context, input *SyncEnv
 		return nil, huma.Error500InternalServerError("service not available")
 	}
 
-	// Sync registries
+	var syncErrors []string
 	if err := h.environmentService.SyncRegistriesToEnvironment(ctx, input.ID); err != nil {
 		slog.WarnContext(ctx, "Failed to sync registries", "environmentID", input.ID, "error", err.Error())
+		syncErrors = append(syncErrors, "registries: "+err.Error())
 	}
 
 	// Sync git repositories
 	if err := h.environmentService.SyncRepositoriesToEnvironment(ctx, input.ID); err != nil {
 		slog.WarnContext(ctx, "Failed to sync git repositories", "environmentID", input.ID, "error", err.Error())
+		syncErrors = append(syncErrors, "git repositories: "+err.Error())
+	}
+	if len(syncErrors) > 0 {
+		return nil, huma.Error502BadGateway("environment synchronization failed: " + strings.Join(syncErrors, "; "))
 	}
 
 	return &SyncEnvironmentOutput{

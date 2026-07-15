@@ -8,14 +8,14 @@
 	import { handleApiResultWithCallbacks } from '$lib/utils/api';
 	import { tryCatch } from '$lib/utils/api';
 	import type { Paginated, SearchPaginationSortRequest } from '$lib/types/shared';
-	import type { ContainerRegistry, ContainerRegistryPullUsage } from '$lib/types/docker';
+	import type { ContainerRegistry, ContainerRegistryEnvironmentStatus, ContainerRegistryPullUsage } from '$lib/types/docker';
 	import type { ColumnSpec, MobileFieldVisibility, BulkAction } from '$lib/components/arcane-table';
 	import { UniversalMobileCard } from '$lib/components/arcane-table/index.js';
 	import EnabledStatusCell from '$lib/components/arcane-table/cells/enabled-status-cell.svelte';
 	import CreatedAtCell from '$lib/components/arcane-table/cells/created-at-cell.svelte';
 	import { m } from '$lib/paraglide/messages';
 	import { containerRegistryService } from '$lib/services/container-registry-service';
-	import { RegistryIcon, UserIcon, ExternalLinkIcon, EditIcon, TrashIcon, TestIcon } from '$lib/icons';
+	import { RegistryIcon, UserIcon, ExternalLinkIcon, EditIcon, TrashIcon, TestIcon, DownloadIcon } from '$lib/icons';
 	import { hasPermission } from '$lib/utils/auth';
 	import IfPermitted from '$lib/components/if-permitted.svelte';
 
@@ -24,13 +24,19 @@
 		selectedIds = $bindable(),
 		requestOptions = $bindable(),
 		pullUsageByRegistry = {},
-		onEditRegistry
+		environmentStatuses = {},
+		selectedEnvironmentId = '0',
+		onEditRegistry,
+		onTestRemotePull
 	}: {
 		registries: Paginated<ContainerRegistry>;
 		selectedIds: string[];
 		requestOptions: SearchPaginationSortRequest;
 		pullUsageByRegistry?: Record<string, ContainerRegistryPullUsage>;
+		environmentStatuses?: Record<string, ContainerRegistryEnvironmentStatus>;
+		selectedEnvironmentId?: string;
 		onEditRegistry: (registry: ContainerRegistry) => void;
+		onTestRemotePull: (registry: ContainerRegistry) => void;
 	} = $props();
 
 	let removingId = $state<string | null>(null);
@@ -61,6 +67,15 @@
 			return m.registries_pull_limit_value({ remaining: usage.remaining, limit: usage.limit });
 		}
 		return m.registries_observed_pulls_value({ count: usage.observedPulls });
+	}
+
+	function formatEnvironmentStatus(item: ContainerRegistry) {
+		if (selectedEnvironmentId === '0') return m.registries_status_local();
+		const status = environmentStatuses[item.id]?.syncStatus;
+		if (status === 'synced') return m.registries_status_synced();
+		if (status === 'syncing') return m.registries_status_syncing();
+		if (status === 'failed') return m.registries_status_failed();
+		return m.registries_status_not_synced();
 	}
 
 	async function handleDeleteSelected(ids: string[]) {
@@ -176,6 +191,12 @@
 			cell: PullUsageCell
 		},
 		{
+			id: 'environmentStatus',
+			accessorFn: (row) => row.id,
+			title: m.registries_environment_status(),
+			cell: EnvironmentStatusCell
+		},
+		{
 			accessorKey: 'createdAt',
 			title: m.common_created(),
 			sortable: true,
@@ -189,6 +210,7 @@
 		{ id: 'description', label: m.common_description(), defaultVisible: true },
 		{ id: 'enabled', label: m.common_status(), defaultVisible: true },
 		{ id: 'pullUsage', label: m.registries_pull_usage(), defaultVisible: true },
+		{ id: 'environmentStatus', label: m.registries_environment_status(), defaultVisible: true },
 		{ id: 'createdAt', label: m.common_created(), defaultVisible: true }
 	];
 
@@ -240,6 +262,10 @@
 
 {#snippet PullUsageCell({ item }: { item: ContainerRegistry })}
 	<span class="text-sm">{formatPullUsage(item)}</span>
+{/snippet}
+
+{#snippet EnvironmentStatusCell({ item }: { item: ContainerRegistry })}
+	<span class="text-sm" title={environmentStatuses[item.id]?.lastSyncError ?? ''}>{formatEnvironmentStatus(item)}</span>
 {/snippet}
 
 {#snippet RegistryMobileCardSnippet({
@@ -294,9 +320,18 @@
 				{:else}
 					<TestIcon class="size-4" />
 				{/if}
-				{m.registries_test_connection()}
+				{item.registryType === 'ecr' ? m.registries_publisher_test() : m.registries_test_connection()}
 			</DropdownMenu.Item>
 		</IfPermitted>
+
+		{#if selectedEnvironmentId !== '0'}
+			<IfPermitted perm="registries:test">
+				<DropdownMenu.Item onclick={() => onTestRemotePull(item)}>
+					<DownloadIcon class="size-4" />
+					{m.registries_test_remote_pull()}
+				</DropdownMenu.Item>
+			</IfPermitted>
+		{/if}
 
 		<IfPermitted perm="registries:update">
 			<DropdownMenu.Item onclick={() => onEditRegistry(item)}>

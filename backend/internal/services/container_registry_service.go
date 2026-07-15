@@ -166,6 +166,18 @@ func (s *ContainerRegistryService) CreateRegistry(ctx context.Context, req model
 		registry.AWSAccessKeyID = req.AWSAccessKeyID
 		registry.AWSSecretAccessKey = encryptedSecret
 		registry.AWSRegion = req.AWSRegion
+		if strings.TrimSpace(req.ConsumerAWSAccessKeyID) != "" || strings.TrimSpace(req.ConsumerAWSSecretAccessKey) != "" {
+			if strings.TrimSpace(req.ConsumerAWSAccessKeyID) == "" || strings.TrimSpace(req.ConsumerAWSSecretAccessKey) == "" {
+				return nil, &models.ValidationError{Field: "consumerAwsAccessKeyId", Message: "consumer access key ID and secret must be provided together"}
+			}
+			consumerSecret, encryptErr := crypto.Encrypt(req.ConsumerAWSSecretAccessKey)
+			if encryptErr != nil {
+				return nil, fmt.Errorf("failed to encrypt consumer AWS secret access key: %w", encryptErr)
+			}
+			registry.ConsumerAWSAccessKeyID = req.ConsumerAWSAccessKeyID
+			registry.ConsumerAWSSecretAccessKey = consumerSecret
+			registry.ConsumerAWSRegion = firstNonEmptyRegistryStringInternal(req.ConsumerAWSRegion, req.AWSRegion)
+		}
 	} else {
 		if strings.TrimSpace(req.Username) == "" {
 			return nil, &models.ValidationError{Field: "username", Message: "Username is required"}
@@ -258,6 +270,26 @@ func (s *ContainerRegistryService) updateECRRegistryFieldsInternal(registry *mod
 		}
 		utils.UpdateIfChanged(&registry.AWSSecretAccessKey, &encryptedSecret)
 	}
+	utils.UpdateIfChanged(&registry.ConsumerAWSAccessKeyID, req.ConsumerAWSAccessKeyID)
+	utils.UpdateIfChanged(&registry.ConsumerAWSRegion, req.ConsumerAWSRegion)
+	if req.ConsumerAWSAccessKeyID != nil && strings.TrimSpace(*req.ConsumerAWSAccessKeyID) == "" &&
+		(req.ConsumerAWSSecretAccessKey == nil || strings.TrimSpace(*req.ConsumerAWSSecretAccessKey) == "") {
+		registry.ConsumerAWSSecretAccessKey = ""
+		registry.ConsumerAWSRegion = ""
+	}
+	if req.ConsumerAWSSecretAccessKey != nil && *req.ConsumerAWSSecretAccessKey != "" {
+		encryptedSecret, err := crypto.Encrypt(*req.ConsumerAWSSecretAccessKey)
+		if err != nil {
+			return fmt.Errorf("failed to encrypt consumer AWS secret access key: %w", err)
+		}
+		utils.UpdateIfChanged(&registry.ConsumerAWSSecretAccessKey, &encryptedSecret)
+	}
+	if (registry.ConsumerAWSAccessKeyID == "") != (registry.ConsumerAWSSecretAccessKey == "") {
+		return &models.ValidationError{Field: "consumerAwsAccessKeyId", Message: "consumer access key ID and secret must be provided together"}
+	}
+	if registry.ConsumerAWSAccessKeyID != "" && registry.ConsumerAWSRegion == "" {
+		registry.ConsumerAWSRegion = registry.AWSRegion
+	}
 
 	if strings.TrimSpace(registry.AWSAccessKeyID) == "" {
 		return &models.ValidationError{Field: "awsAccessKeyId", Message: "AWS Access Key ID is required"}
@@ -275,6 +307,35 @@ func (s *ContainerRegistryService) updateECRRegistryFieldsInternal(registry *mod
 	}
 
 	return nil
+}
+
+func firstNonEmptyRegistryStringInternal(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// TestPullAccess verifies that this node can read a concrete image manifest with
+// the credentials stored in its local registry database.
+func (s *ContainerRegistryService) TestPullAccess(ctx context.Context, registryID, repository, tag string) (containerregistry.PullTestResult, error) {
+	reg, err := s.GetRegistryByID(ctx, registryID)
+	if err != nil {
+		return containerregistry.PullTestResult{}, err
+	}
+	repository = strings.TrimSpace(repository)
+	tag = strings.TrimSpace(tag)
+	if repository == "" || tag == "" {
+		return containerregistry.PullTestResult{}, errors.New("repository and tag are required")
+	}
+	imageRef := strings.TrimRight(utilsregistry.NormalizeRegistryURL(reg.URL), "/") + "/" + repository + ":" + tag
+	result, err := s.inspectImageDigestInternal(ctx, imageRef, nil)
+	if err != nil {
+		return containerregistry.PullTestResult{}, fmt.Errorf("pull access check failed for %s: %w", imageRef, err)
+	}
+	return containerregistry.PullTestResult{ImageReference: imageRef, Digest: result.Digest, Message: "Image manifest is readable"}, nil
 }
 
 func (s *ContainerRegistryService) updateGenericRegistryFieldsInternal(registry *models.ContainerRegistry, req models.UpdateContainerRegistryRequest) error {

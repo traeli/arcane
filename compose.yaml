@@ -1,0 +1,68 @@
+name: arcane
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: arcane-postgres
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-arcane}
+      POSTGRES_USER: ${POSTGRES_USER:-arcane}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - arcane-postgres-data:/var/lib/postgresql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  arcane:
+    image: arcane-custom:local
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: arcane
+    restart: unless-stopped
+    cgroup: host
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${ARCANE_PORT:-3552}:3552"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${ARCANE_DATA_DIR:-./data}:/app/data
+      - ${ARCANE_BUILDS_DIR:-./builds}:/builds
+    environment:
+      APP_URL: ${APP_URL:?Set APP_URL in .env}
+      PORT: "3552"
+      GIN_MODE: release
+      ENVIRONMENT: production
+      PUID: ${PUID:-65532}
+      PGID: ${PGID:-65532}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY in .env}
+      DATABASE_URL: postgres://${POSTGRES_USER:-arcane}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-arcane}?sslmode=disable
+      TZ: ${TZ:-UTC}
+    healthcheck:
+      test: ["CMD", "/app/arcane", "health", "--timeout", "2s"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  arcane-postgres-data:
+    name: arcane-postgres-data

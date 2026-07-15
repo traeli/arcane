@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"github.com/moby/moby/client"
 	"go.getarcane.app/sys/crypto"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type EnvironmentService struct {
@@ -1883,20 +1885,21 @@ func (s *EnvironmentService) SyncRegistriesToEnvironment(ctx context.Context, en
 		}
 
 		if registryType == registryTypeECR {
-			decryptedSecret, err := crypto.Decrypt(reg.AWSSecretAccessKey)
+			accessKeyID := firstNonEmptyStringInternal(reg.ConsumerAWSAccessKeyID, reg.AWSAccessKeyID)
+			encryptedSecret := firstNonEmptyStringInternal(reg.ConsumerAWSSecretAccessKey, reg.AWSSecretAccessKey)
+			region := firstNonEmptyStringInternal(reg.ConsumerAWSRegion, reg.AWSRegion)
+			decryptedSecret, err := crypto.Decrypt(encryptedSecret)
 			if err != nil {
-				slog.WarnContext(ctx, "Failed to decrypt ECR secret for sync", "registryID", reg.ID, "registryURL", reg.URL, "error", err.Error())
-				continue
+				return fmt.Errorf("decrypt ECR consumer secret for registry %s: %w", reg.ID, err)
 			}
 
-			syncItem.AWSAccessKeyID = reg.AWSAccessKeyID
+			syncItem.AWSAccessKeyID = accessKeyID
 			syncItem.AWSSecretAccessKey = decryptedSecret
-			syncItem.AWSRegion = reg.AWSRegion
+			syncItem.AWSRegion = region
 		} else {
 			decryptedToken, err := crypto.Decrypt(reg.Token)
 			if err != nil {
-				slog.WarnContext(ctx, "Failed to decrypt registry token for sync", "registryID", reg.ID, "registryURL", reg.URL, "error", err.Error())
-				continue
+				return fmt.Errorf("decrypt consumer token for registry %s: %w", reg.ID, err)
 			}
 
 			syncItem.Username = reg.Username
@@ -1907,15 +1910,19 @@ func (s *EnvironmentService) SyncRegistriesToEnvironment(ctx context.Context, en
 	}
 
 	// Prepare the sync request
-	syncReq := containerregistry.SyncRequest{
-		Registries: syncItems,
-	}
+	syncReq := containerregistry.SyncRequest{Registries: syncItems}
 
 	// Marshal the request
-	reqBody, err := json.Marshal(syncReq)
+	versionBody, err := json.Marshal(syncItems)
 	if err != nil {
 		return fmt.Errorf("failed to marshal sync request: %w", err)
 	}
+	syncReq.Version = fmt.Sprintf("%x", sha256.Sum256(versionBody))
+	reqBody, err := json.Marshal(syncReq)
+	if err != nil {
+		return fmt.Errorf("failed to marshal versioned sync request: %w", err)
+	}
+	s.updateRegistrySyncStatusesInternal(ctx, environmentID, registries, syncReq.Version, "syncing", "")
 
 	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -1923,22 +1930,92 @@ func (s *EnvironmentService) SyncRegistriesToEnvironment(ctx context.Context, en
 	slog.InfoContext(ctx, "Sending sync request to agent", "url", target.TargetURL+"/api/container-registries/sync", "registryCount", len(syncItems), "isEdge", target.IsEdge)
 
 	var result struct {
-		Success bool `json:"success"`
-		Data    struct {
-			Message string `json:"message"`
-		} `json:"data"`
+		Success bool                                 `json:"success"`
+		Data    containerregistry.RegistrySyncResult `json:"data"`
 	}
 	if err := s.proxyJSONRequestForTargetInternal(reqCtx, target, http.MethodPost, "/api/container-registries/sync", reqBody, &result); err != nil {
+		s.updateRegistrySyncStatusesInternal(ctx, environmentID, registries, syncReq.Version, "failed", err.Error())
 		return fmt.Errorf("failed to send sync request: %w", err)
 	}
 
 	if !result.Success {
+		s.updateRegistrySyncStatusesInternal(ctx, environmentID, registries, syncReq.Version, "failed", result.Data.Message)
 		return fmt.Errorf("sync failed: %s", result.Data.Message)
 	}
+	s.updateRegistrySyncStatusesInternal(ctx, environmentID, registries, syncReq.Version, "synced", "")
 
 	slog.InfoContext(ctx, "Successfully synced registries to environment", "environmentID", environmentID, "environmentName", target.Name)
 
 	return nil
+}
+
+func (s *EnvironmentService) updateRegistrySyncStatusesInternal(ctx context.Context, environmentID string, registries []models.ContainerRegistry, version, status, syncError string) {
+	now := time.Now().UTC()
+	for i := range registries {
+		row := models.ContainerRegistryEnvironmentStatus{
+			RegistryID: registries[i].ID, EnvironmentID: environmentID, DesiredVersion: version,
+			SyncStatus: status, LastSyncAt: &now, LastSyncError: syncError, PullTestStatus: "unknown",
+		}
+		if status == "synced" {
+			row.AppliedVersion = version
+		}
+		assignments := map[string]any{
+			"desired_version": version, "sync_status": status, "last_sync_at": now,
+			"last_sync_error": syncError, "updated_at": now,
+		}
+		if status == "synced" {
+			assignments["applied_version"] = version
+		}
+		err := s.db.WithContext(ctx).Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "registry_id"}, {Name: "environment_id"}},
+			DoUpdates: clause.Assignments(assignments),
+		}).Create(&row).Error
+		if err != nil {
+			slog.WarnContext(ctx, "failed to persist registry sync status", "registryID", registries[i].ID, "environmentID", environmentID, "error", err)
+		}
+	}
+}
+
+func (s *EnvironmentService) GetRegistryEnvironmentStatuses(ctx context.Context, environmentID string) ([]models.ContainerRegistryEnvironmentStatus, error) {
+	var statuses []models.ContainerRegistryEnvironmentStatus
+	if err := s.db.WithContext(ctx).Where("environment_id = ?", environmentID).Find(&statuses).Error; err != nil {
+		return nil, fmt.Errorf("list registry environment statuses: %w", err)
+	}
+	return statuses, nil
+}
+
+func (s *EnvironmentService) TestRegistryPullAccess(ctx context.Context, environmentID, registryID string, req containerregistry.PullTestRequest) (containerregistry.PullTestResult, error) {
+	if environmentID == "0" {
+		return containerregistry.PullTestResult{}, errors.New("remote environment is required for consumer pull testing")
+	}
+	if err := s.SyncRegistriesToEnvironment(ctx, environmentID); err != nil {
+		return containerregistry.PullTestResult{}, fmt.Errorf("synchronize registry credentials before pull test: %w", err)
+	}
+	var response struct {
+		Success bool                             `json:"success"`
+		Data    containerregistry.PullTestResult `json:"data"`
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return containerregistry.PullTestResult{}, err
+	}
+	err = s.ProxyJSONRequest(ctx, environmentID, http.MethodPost, "/api/container-registries/"+registryID+"/test-pull", body, &response)
+	now := time.Now().UTC()
+	updates := map[string]any{"last_pull_test_at": now, "pull_test_status": "success", "last_pull_test_error": ""}
+	if err != nil || !response.Success {
+		message := "remote pull test failed"
+		if err != nil {
+			message = err.Error()
+		}
+		updates["pull_test_status"] = "failed"
+		updates["last_pull_test_error"] = message
+		_ = s.db.WithContext(ctx).Model(&models.ContainerRegistryEnvironmentStatus{}).
+			Where("registry_id = ? AND environment_id = ?", registryID, environmentID).Updates(updates).Error
+		return containerregistry.PullTestResult{}, fmt.Errorf("remote pull test: %s", message)
+	}
+	_ = s.db.WithContext(ctx).Model(&models.ContainerRegistryEnvironmentStatus{}).
+		Where("registry_id = ? AND environment_id = ?", registryID, environmentID).Updates(updates).Error
+	return response.Data, nil
 }
 
 // SyncRepositoriesToEnvironment syncs all git repositories from this manager to a remote environment

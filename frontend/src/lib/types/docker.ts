@@ -845,6 +845,9 @@ export interface ContainerRegistryCreateDto {
 	awsAccessKeyId?: string;
 	awsSecretAccessKey?: string;
 	awsRegion?: string;
+	consumerAwsAccessKeyId?: string;
+	consumerAwsSecretAccessKey?: string;
+	consumerAwsRegion?: string;
 }
 
 export interface ContainerRegistryUpdateDto {
@@ -859,6 +862,9 @@ export interface ContainerRegistryUpdateDto {
 	awsAccessKeyId?: string;
 	awsSecretAccessKey?: string;
 	awsRegion?: string;
+	consumerAwsAccessKeyId?: string;
+	consumerAwsSecretAccessKey?: string;
+	consumerAwsRegion?: string;
 }
 
 export interface ContainerRegistry {
@@ -873,8 +879,29 @@ export interface ContainerRegistry {
 	repositoryNames?: string[];
 	awsAccessKeyId?: string;
 	awsRegion?: string;
+	consumerAwsAccessKeyId?: string;
+	consumerAwsRegion?: string;
 	createdAt?: string;
 	updatedAt?: string;
+}
+
+export interface ContainerRegistryEnvironmentStatus {
+	registryId: string;
+	environmentId: string;
+	desiredVersion: string;
+	appliedVersion: string;
+	syncStatus: 'pending' | 'syncing' | 'synced' | 'failed';
+	lastSyncAt?: string;
+	lastSyncError?: string;
+	pullTestStatus: 'unknown' | 'success' | 'failed';
+	lastPullTestAt?: string;
+	lastPullTestError?: string;
+}
+
+export interface ContainerRegistryPullTestResult {
+	imageReference: string;
+	digest: string;
+	message: string;
 }
 
 export interface ContainerRegistryPullUsageResponse {

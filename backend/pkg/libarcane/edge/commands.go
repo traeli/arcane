@@ -19,6 +19,7 @@ var commandRoutes = []commandRoute{
 	{Method: http.MethodGet, PathPattern: "/api/app-version", CommandName: "system.version"},
 	{Method: http.MethodGet, PathPattern: "/api/swarm/node-identity", CommandName: "swarm.node_identity"},
 	{Method: http.MethodPost, PathPattern: "/api/container-registries/sync", CommandName: "container_registry.sync"},
+	{Method: http.MethodPost, PathPattern: "/api/container-registries/{id}/test-pull", CommandName: "container_registry.test_pull"},
 	{Method: http.MethodPost, PathPattern: "/api/git-repositories/sync", CommandName: "git_repository.sync"},
 
 	{Method: http.MethodGet, PathPattern: "/api/environments/{id}/containers", CommandName: "container.list"},

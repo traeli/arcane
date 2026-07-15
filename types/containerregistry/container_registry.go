@@ -55,6 +55,9 @@ type ContainerRegistry struct {
 	// Required: false
 	AWSRegion string `json:"awsRegion,omitempty"`
 
+	ConsumerAWSAccessKeyID string `json:"consumerAwsAccessKeyId,omitempty"`
+	ConsumerAWSRegion      string `json:"consumerAwsRegion,omitempty"`
+
 	// CreatedAt is the date and time at which the registry was created.
 	//
 	// Required: true
@@ -224,6 +227,43 @@ type Sync struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
+type RegistrySyncResult struct {
+	Message        string `json:"message"`
+	AppliedVersion string `json:"appliedVersion,omitempty"`
+}
+
+type EnvironmentStatus struct {
+	RegistryID        string     `json:"registryId"`
+	EnvironmentID     string     `json:"environmentId"`
+	DesiredVersion    string     `json:"desiredVersion"`
+	AppliedVersion    string     `json:"appliedVersion"`
+	SyncStatus        string     `json:"syncStatus"`
+	LastSyncAt        *time.Time `json:"lastSyncAt,omitempty"`
+	LastSyncError     string     `json:"lastSyncError,omitempty"`
+	PullTestStatus    string     `json:"pullTestStatus"`
+	LastPullTestAt    *time.Time `json:"lastPullTestAt,omitempty"`
+	LastPullTestError string     `json:"lastPullTestError,omitempty"`
+}
+
+type PullTestRequest struct {
+	Repository string `json:"repository" binding:"required"`
+	Tag        string `json:"tag" binding:"required"`
+}
+
+type PullTestResult struct {
+	ImageReference string `json:"imageReference"`
+	Digest         string `json:"digest"`
+	Message        string `json:"message"`
+}
+
+type RepositoryCatalog struct {
+	Repositories []string `json:"repositories"`
+}
+type TagCatalog struct {
+	Repository string   `json:"repository"`
+	Tags       []string `json:"tags"`
+}
+
 type Credential struct {
 	// URL of the container registry.
 	//
@@ -251,4 +291,5 @@ type SyncRequest struct {
 	//
 	// Required: true
 	Registries []Sync `json:"registries" binding:"required"`
+	Version    string `json:"version,omitempty"`
 }

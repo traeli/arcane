@@ -38,6 +38,7 @@ func setupEnvironmentServiceTestDB(t *testing.T) *database.DB {
 	require.NoError(t, db.AutoMigrate(
 		&models.Environment{},
 		&models.ContainerRegistry{},
+		&models.ContainerRegistryEnvironmentStatus{},
 		&models.SettingVariable{},
 		&models.User{},
 		&models.ApiKey{},
@@ -300,6 +301,39 @@ func TestEnvironmentService_SyncRegistriesToEnvironment_IncludesECRFields(t *tes
 
 	err := svc.SyncRegistriesToEnvironment(ctx, "env-1")
 	require.NoError(t, err)
+}
+
+func TestEnvironmentService_SyncRegistriesToEnvironment_PrefersConsumerECRCredentials(t *testing.T) {
+	ctx := context.Background()
+	db := setupEnvironmentServiceTestDB(t)
+	svc := NewEnvironmentService(db, nil, nil, nil, nil, nil)
+	createTestECRRegistry(t, db, "reg-ecr-consumer")
+	consumerSecret, err := crypto.Encrypt("consumer-secret")
+	require.NoError(t, err)
+	require.NoError(t, db.Model(&models.ContainerRegistry{}).Where("id = ?", "reg-ecr-consumer").Updates(map[string]any{
+		"consumer_aws_access_key_id": "CONSUMERKEY", "consumer_aws_secret_access_key": consumerSecret,
+		"consumer_aws_region": "us-west-2",
+	}).Error)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request containerregistry.SyncRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		require.NotEmpty(t, request.Version)
+		require.Len(t, request.Registries, 1)
+		require.Equal(t, "CONSUMERKEY", request.Registries[0].AWSAccessKeyID)
+		require.Equal(t, "consumer-secret", request.Registries[0].AWSSecretAccessKey)
+		require.Equal(t, "us-west-2", request.Registries[0].AWSRegion)
+		_, _ = w.Write([]byte(`{"success":true,"data":{"message":"ok"}}`))
+	}))
+	defer server.Close()
+	createTestEnvironment(t, db, "env-consumer", server.URL, new("token"))
+
+	require.NoError(t, svc.SyncRegistriesToEnvironment(ctx, "env-consumer"))
+	statuses, err := svc.GetRegistryEnvironmentStatuses(ctx, "env-consumer")
+	require.NoError(t, err)
+	require.Len(t, statuses, 1)
+	require.Equal(t, "synced", statuses[0].SyncStatus)
+	require.Equal(t, statuses[0].DesiredVersion, statuses[0].AppliedVersion)
 }
 
 func TestEnvironmentService_SyncRepositoriesToEnvironment_UsesAgentHeaders(t *testing.T) {
