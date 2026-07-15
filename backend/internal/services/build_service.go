@@ -409,8 +409,8 @@ func (s *BuildService) prepareWorkspaceSourceBuildInternal(ctx context.Context, 
 			unlock()
 			return req, nil, noop, fmt.Errorf("generated image reference is invalid: %w", err)
 		}
-		req.ContextDir = contextPath
-		req.Dockerfile = "Dockerfile"
+		req.ContextDir = filepath.Dir(contextPath)
+		req.Dockerfile = filepath.ToSlash(filepath.Join(filepath.Base(contextPath), "Dockerfile"))
 		req.Provider = "local"
 		req.Tags = []string{imageReference}
 		return req, source, unlock, nil
