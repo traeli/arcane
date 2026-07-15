@@ -263,15 +263,14 @@
 	const selectedQuickRegistry = $derived(
 		(registriesQuery.data?.data ?? []).find((registry) => registry.id === quickRegistryId && registry.enabled)
 	);
+	const quickRepositoryName = $derived(quickDirectory.split('/').filter(Boolean).pop()?.toLowerCase() ?? '');
 	const quickImageReference = $derived.by(() => {
-		if (!quickDirectory) return '';
-		const repository = quickDirectory.split('/').filter(Boolean).pop() ?? '';
-		if (!repository) return '';
+		if (!quickRepositoryName) return '';
 		const tag = quickTag.trim();
 		if (!tag) return '';
-		if (!$inputs.push.value) return `${repository}:${tag}`;
+		if (!$inputs.push.value) return `${quickRepositoryName}:${tag}`;
 		if (!selectedQuickRegistry) return '';
-		return `${normalizeRegistryHost(selectedQuickRegistry.url)}/${repository}:${tag}`;
+		return `${normalizeRegistryHost(selectedQuickRegistry.url)}/${quickRepositoryName}:${tag}`;
 	});
 
 	const repositoryOptions = $derived((selectedRegistry?.repositoryNames ?? []).map((name) => ({ label: name, value: name })));

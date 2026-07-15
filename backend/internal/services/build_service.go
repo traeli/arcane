@@ -337,11 +337,11 @@ func (s *BuildService) prepareWorkspaceSourceBuildInternal(ctx context.Context, 
 
 	repositoryName := strings.TrimSpace(options.RepositoryName)
 	if options.Mode == SourceUpdateQuickBuild {
-		repositoryName = filepath.Base(contextPath)
+		repositoryName = strings.ToLower(filepath.Base(contextPath))
 	}
 	if _, err := ref.ParseNormalizedNamed(repositoryName + ":latest"); err != nil || strings.Contains(repositoryName, "/") {
 		unlock()
-		return req, nil, noop, errors.New("build directory name is not a valid lowercase image repository name")
+		return req, nil, noop, errors.New("build directory name cannot be used as an image repository name")
 	}
 
 	var registryPrefix string

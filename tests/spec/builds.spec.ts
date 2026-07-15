@@ -165,8 +165,8 @@ test.describe('Build workspace provider flows', () => {
 					success: true,
 					data: [
 						{
-							name: 'order-service',
-							path: '/order-service',
+							name: 'AdminService',
+							path: '/AdminService',
 							isDirectory: true,
 							size: 0,
 							modTime: new Date().toISOString(),
@@ -254,13 +254,16 @@ test.describe('Build workspace provider flows', () => {
 		await page.locator('#build-quick-toggle').click();
 		await expect(page.locator('#build-quick-directory')).toBeVisible();
 		await page.locator('#build-quick-directory').click();
-		const directoryOption = page.getByRole('option', { name: 'order-service' });
+		const directoryOption = page.getByRole('option', { name: 'AdminService' });
 		await directoryOption.click();
 		await expect(directoryOption).toBeHidden();
 		await page.locator('#build-quick-registry').click();
 		await page.getByRole('option', { name: /registry\.example\.com/ }).click();
 		await expect(page.locator('#build-quick-tag')).toHaveValue('222222222222');
 		await expect(page.locator('#build-quick-tag')).toBeDisabled();
+		await expect(
+			page.getByText('registry.example.com/adminservice:222222222222', { exact: true })
+		).toBeVisible();
 
 		await expect(page.locator('#build-push')).toHaveAttribute('aria-checked', 'true');
 		await expect(page.locator('#build-load')).toHaveAttribute('aria-checked', 'false');
@@ -269,7 +272,7 @@ test.describe('Build workspace provider flows', () => {
 
 		await page.locator('#build-git-update').click();
 		await expect.poll(() => gitPayload).not.toBeNull();
-		expect(String(gitPayload?.contextDir)).toMatch(/\/order-service$/);
+		expect(String(gitPayload?.contextDir)).toMatch(/\/AdminService$/);
 
 		await page.locator('#build-quick-action').click();
 		await expect.poll(() => buildPayload).not.toBeNull();
@@ -282,7 +285,7 @@ test.describe('Build workspace provider flows', () => {
 			registryId: 'registry-quick',
 			tags: ['222222222222']
 		});
-		expect(String(buildPayload?.contextDir)).toMatch(/\/order-service$/);
+		expect(String(buildPayload?.contextDir)).toMatch(/\/AdminService$/);
 	});
 
 	test('submits remote git build context from the dedicated context mode', async ({ page }) => {

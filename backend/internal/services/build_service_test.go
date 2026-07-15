@@ -292,7 +292,7 @@ func TestBuildService_QuickBuildUsesLocalCommitWithoutPull(t *testing.T) {
 	require.NoError(t, db.AutoMigrate(&models.ContainerRegistry{}))
 
 	root := t.TempDir()
-	repoPath := filepath.Join(root, "order-service")
+	repoPath := filepath.Join(root, "AdminService")
 	repository, err := gitlib.PlainInit(repoPath, false)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(repoPath, "Dockerfile"), []byte("FROM scratch\n"), 0o644))
@@ -354,7 +354,7 @@ func TestBuildService_QuickBuildUsesLocalCommitWithoutPull(t *testing.T) {
 	assert.True(t, captured.Push)
 	assert.False(t, captured.Load)
 	require.Len(t, captured.Tags, 1)
-	assert.Equal(t, "registry.example.com/order-service:"+revision.String()[:12], captured.Tags[0])
+	assert.Equal(t, "registry.example.com/adminservice:"+revision.String()[:12], captured.Tags[0])
 
 	var buildRecord models.ImageBuild
 	require.NoError(t, db.First(&buildRecord).Error)
