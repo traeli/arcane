@@ -1,0 +1,48 @@
+Port: "11010"
+Mode: "debug"
+Region: "cn"
+
+Mysql:
+  Host: "mysql_1"
+  Port: "3306"
+  Name: "root"
+  Password: "123456"
+  Db: "smart_wearables"
+  Charset: "utf8mb4"
+  Log: true
+
+AuroraMysql:
+  Host: "mysql_1"
+  Port: "3306"
+  Name: "root"
+  Password: "123456"
+  Db: "smart_wearables"
+  Charset: "utf8mb4"
+  Log: true
+
+PaymentMysql:
+  Host: "mysql_1"
+  Port: "3306"
+  Name: "root"
+  Password: "123456"
+  Db: "smart_wearables"
+  Charset: "utf8mb4"
+  Log: true
+
+Mongodb:
+  Url: "mongodb://mongo1:27017/?replicaSet=rs0"
+  DB: "smart_wearables"
+
+Redis:
+  Addr: "redis:6379"
+  Username: ""
+  Password: ""
+  Pool: 20
+  DB: 2
+  MinId: 1
+  TLSEnabled: false
+
+MainServiceInternal:
+  BaseURL: "http://main-service:8080"
+  Token: "test-payment-admin-token-change-me"
+  TimeoutSeconds: 10

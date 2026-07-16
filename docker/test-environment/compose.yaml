@@ -1,0 +1,238 @@
+name: smartring-test
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${MIDDLEWARE_BIND_IP:-127.0.0.1}:6379:6379"
+    networks:
+      - app-network
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  mysql_1:
+    image: mysql:8.0
+    container_name: mysql_1
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: "123456"
+      MYSQL_DATABASE: smart_wearables
+    ports:
+      - "${MIDDLEWARE_BIND_IP:-127.0.0.1}:13306:3306"
+    networks:
+      - app-network
+    volumes:
+      - mysql-data-1:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  mysql_2:
+    image: mysql:8.0
+    container_name: mysql_2
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: "123456"
+      MYSQL_DATABASE: has
+    ports:
+      - "${MIDDLEWARE_BIND_IP:-127.0.0.1}:23306:3306"
+    networks:
+      - app-network
+    volumes:
+      - mysql-data-2:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  mongo1:
+    image: mongo:6.0
+    container_name: mongo1
+    restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "${MIDDLEWARE_BIND_IP:-127.0.0.1}:27017:27017"
+    networks:
+      - app-network
+    volumes:
+      - mongo1-data:/data/db
+      - ./mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mongosh --quiet --eval 'try { quit(rs.status().ok ? 0 : 1) } catch (e) { try { rs.initiate({_id: \"rs0\", members: [{_id: 0, host: \"mongo1:27017\"}]}) } catch (_) {} quit(1) }'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  main-service:
+    image: ${ECR_REGISTRY:?Set ECR_REGISTRY in .env}/smartringmainservice:${MAIN_SERVICE_TAG:?Set MAIN_SERVICE_TAG in .env}
+    container_name: smartring-main-service
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 20s
+    environment:
+      APP_ENV: test
+      APP_CONFIG: /app/env.test.yaml
+      PAYMENT_ADMIN_INTERNAL_TOKEN: ${PAYMENT_ADMIN_INTERNAL_TOKEN:-test-payment-admin-token-change-me}
+      TZ: Asia/Shanghai
+    ports:
+      - "${APP_BIND_IP:-0.0.0.0}:8080:8080"
+    networks:
+      - app-network
+    volumes:
+      - ./configs/main-service.yaml:/app/env.test.yaml:ro
+      - type: bind
+        source: ${JWT_PRIVATE_KEY_FILE:?Set JWT_PRIVATE_KEY_FILE in .env}
+        target: /app/jwt-private.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${JWT_PUBLIC_KEYS_DIR:?Set JWT_PUBLIC_KEYS_DIR in .env}
+        target: /app/jwt-public-keys
+        read_only: true
+        bind:
+          create_host_path: false
+      - main-service-logs:/app/log
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql_1:
+        condition: service_healthy
+      mysql_2:
+        condition: service_healthy
+      mongo1:
+        condition: service_healthy
+
+  health-api:
+    image: ${ECR_REGISTRY:?Set ECR_REGISTRY in .env}/smartringhealthapi:${HEALTH_API_TAG:?Set HEALTH_API_TAG in .env}
+    container_name: smartring-health-api
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 20s
+    environment:
+      APP_ENV: test
+      APP_CONFIG: /app/env.test.yaml
+      TZ: Asia/Shanghai
+    ports:
+      - "${APP_BIND_IP:-0.0.0.0}:8081:8081"
+    networks:
+      - app-network
+    volumes:
+      - ./configs/health-api.yaml:/app/env.test.yaml:ro
+      - type: bind
+        source: ${JWT_PUBLIC_KEYS_DIR:?Set JWT_PUBLIC_KEYS_DIR in .env}
+        target: /app/jwt-public-keys
+        read_only: true
+        bind:
+          create_host_path: false
+      - health-api-logs:/app/log
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql_1:
+        condition: service_healthy
+      mysql_2:
+        condition: service_healthy
+      mongo1:
+        condition: service_healthy
+      main-service:
+        condition: service_started
+
+  admin-service:
+    image: ${ECR_REGISTRY:?Set ECR_REGISTRY in .env}/adminservice:${ADMIN_SERVICE_TAG:?Set ADMIN_SERVICE_TAG in .env}
+    container_name: smartring-admin-service
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 20s
+    environment:
+      MAIN_SERVICE_INTERNAL_BASE_URL: http://main-service:8080
+      MAIN_SERVICE_INTERNAL_TOKEN: ${PAYMENT_ADMIN_INTERNAL_TOKEN:-test-payment-admin-token-change-me}
+      MAIN_SERVICE_INTERNAL_TIMEOUT_SECONDS: "10"
+      TZ: Asia/Shanghai
+    expose:
+      - "11010"
+    networks:
+      - app-network
+    volumes:
+      - ./configs/admin-service.yaml:/app/env.yaml:ro
+      - admin-service-logs:/app/log
+    depends_on:
+      redis:
+        condition: service_healthy
+      mysql_1:
+        condition: service_healthy
+      mongo1:
+        condition: service_healthy
+      main-service:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:11010/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  admin-web:
+    image: ${ECR_REGISTRY:?Set ECR_REGISTRY in .env}/adminweb:${ADMIN_WEB_TAG:?Set ADMIN_WEB_TAG in .env}
+    container_name: smartring-admin-web
+    restart: unless-stopped
+    ports:
+      - "${APP_BIND_IP:-0.0.0.0}:11011:80"
+    networks:
+      - app-network
+    depends_on:
+      admin-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+networks:
+  app-network:
+    name: smartring-test-network
+    driver: bridge
+
+volumes:
+  redis-data:
+  mysql-data-1:
+  mysql-data-2:
+  mongo1-data:
+  main-service-logs:
+  health-api-logs:
+  admin-service-logs:

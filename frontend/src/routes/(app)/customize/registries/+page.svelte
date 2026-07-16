@@ -19,6 +19,9 @@
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
 	import { ArcaneButton } from '$lib/components/arcane-button';
+	import * as Select from '$lib/components/ui/select';
+	import { Spinner } from '$lib/components/ui/spinner';
+	import { CopyButton } from '$lib/components/ui/copy-button';
 
 	let { data } = $props();
 
@@ -34,6 +37,13 @@
 	let isPullTesting = $state(false);
 	let pullTestRepositories = $state<string[]>([]);
 	let pullTestTags = $state<string[]>([]);
+	let isImageBrowserOpen = $state(false);
+	let isImageBrowserLoading = $state(false);
+	let browserRegistries = $state<ContainerRegistry[]>([]);
+	let browserRegistryId = $state('');
+	let browserRepositories = $state<string[]>([]);
+	let browserRepository = $state('');
+	let browserTags = $state<string[]>([]);
 	let selectedEnvironmentId = $derived(environmentStore.selected?.id ?? '0');
 	let requestOptions = $state(untrack(() => data.registryRequestOptions));
 	const pullUsageQuery = createQuery(() => ({
@@ -122,6 +132,64 @@
 		}
 	}
 
+	function registryImageReference(registry: ContainerRegistry, repository: string, tag: string) {
+		const host =
+			registry.url
+				.trim()
+				.replace(/^https?:\/\//, '')
+				.replace(/\/$/, '') || 'docker.io';
+		return `${host}/${repository}:${tag}`;
+	}
+
+	async function loadBrowserTags(registryId: string, repository: string) {
+		browserTags = [];
+		if (!registryId || !repository) return;
+		isImageBrowserLoading = true;
+		try {
+			browserTags = await containerRegistryService.getTags(registryId, repository);
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : m.registries_catalog_load_failed());
+		} finally {
+			isImageBrowserLoading = false;
+		}
+	}
+
+	async function loadBrowserRepositories(registryId: string) {
+		browserRegistryId = registryId;
+		browserRepositories = [];
+		browserRepository = '';
+		browserTags = [];
+		if (!registryId) return;
+		isImageBrowserLoading = true;
+		try {
+			browserRepositories = await containerRegistryService.getRepositories(registryId);
+			browserRepository = browserRepositories[0] ?? '';
+			if (browserRepository) await loadBrowserTags(registryId, browserRepository);
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : m.registries_catalog_load_failed());
+		} finally {
+			isImageBrowserLoading = false;
+		}
+	}
+
+	async function openImageBrowser() {
+		isImageBrowserOpen = true;
+		isImageBrowserLoading = true;
+		try {
+			const result = await containerRegistryService.getRegistries({
+				pagination: { page: 1, limit: 100 },
+				sort: { column: 'url', direction: 'asc' },
+				filters: { enabled: true }
+			});
+			browserRegistries = result.data;
+			await loadBrowserRepositories(browserRegistries[0]?.id ?? '');
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : m.registries_catalog_load_failed());
+		} finally {
+			isImageBrowserLoading = false;
+		}
+	}
+
 	async function refreshRegistries() {
 		isLoading.refresh = true;
 		handleApiResultWithCallbacks({
@@ -192,6 +260,12 @@
 				onclick: openCreateRegistryDialog
 			});
 		}
+		buttons.push({
+			id: 'browse-images',
+			action: 'inspect',
+			label: m.registries_browse_images(),
+			onclick: openImageBrowser
+		});
 		if (selectedEnvironmentId !== '0' && hasPermission('registries:update')) {
 			buttons.push({
 				id: 'sync-environment',
@@ -317,6 +391,85 @@
 						disabled={!pullTestRepository.trim() || !pullTestTag.trim()}>{m.registries_pull_test_submit()}</ArcaneButton
 					>
 				</Dialog.Footer>
+			</Dialog.Content>
+		</Dialog.Root>
+
+		<Dialog.Root bind:open={isImageBrowserOpen}>
+			<Dialog.Content class="max-w-3xl">
+				<Dialog.Header>
+					<Dialog.Title>{m.registries_browse_images()}</Dialog.Title>
+					<Dialog.Description>{m.registries_browse_images_description()}</Dialog.Description>
+				</Dialog.Header>
+				<div class="grid gap-4 py-4 sm:grid-cols-2">
+					<div class="space-y-2">
+						<Label for="image-browser-registry">{m.registries_browse_registry()}</Label>
+						<Select.Root
+							type="single"
+							value={browserRegistryId}
+							onValueChange={(value) => value && loadBrowserRepositories(value)}
+						>
+							<Select.Trigger id="image-browser-registry" class="w-full">
+								<span class="truncate">
+									{browserRegistries.find((registry) => registry.id === browserRegistryId)?.url ?? m.common_select_placeholder()}
+								</span>
+							</Select.Trigger>
+							<Select.Content style="width: var(--bits-select-anchor-width);">
+								{#each browserRegistries as registry (registry.id)}
+									<Select.Item value={registry.id}>{registry.url || 'docker.io'}</Select.Item>
+								{/each}
+							</Select.Content>
+						</Select.Root>
+					</div>
+					<div class="space-y-2">
+						<Label for="image-browser-repository">{m.registries_browse_repository()}</Label>
+						<Select.Root
+							type="single"
+							value={browserRepository}
+							disabled={!browserRegistryId || browserRepositories.length === 0}
+							onValueChange={(value) => {
+								if (value) {
+									browserRepository = value;
+									void loadBrowserTags(browserRegistryId, value);
+								}
+							}}
+						>
+							<Select.Trigger id="image-browser-repository" class="w-full">
+								<span class="truncate">{browserRepository || m.common_select_placeholder()}</span>
+							</Select.Trigger>
+							<Select.Content style="width: var(--bits-select-anchor-width);">
+								{#each browserRepositories as repository (repository)}
+									<Select.Item value={repository}>{repository}</Select.Item>
+								{/each}
+							</Select.Content>
+						</Select.Root>
+					</div>
+				</div>
+
+				<div class="max-h-96 overflow-y-auto rounded-md border">
+					{#if isImageBrowserLoading}
+						<div class="flex items-center justify-center gap-2 py-12 text-sm">
+							<Spinner class="size-4" />
+							<span>{m.common_loading()}</span>
+						</div>
+					{:else if browserRegistries.length === 0}
+						<p class="text-muted-foreground p-6 text-center text-sm">{m.registries_browse_no_registries()}</p>
+					{:else if browserRepositories.length === 0}
+						<p class="text-muted-foreground p-6 text-center text-sm">{m.registries_browse_no_repositories()}</p>
+					{:else if browserTags.length === 0}
+						<p class="text-muted-foreground p-6 text-center text-sm">{m.registries_browse_no_images()}</p>
+					{:else}
+						{#each browserTags as tag (tag)}
+							{@const registry = browserRegistries.find((item) => item.id === browserRegistryId)}
+							{#if registry}
+								{@const imageReference = registryImageReference(registry, browserRepository, tag)}
+								<div class="flex items-center gap-3 border-b px-4 py-3 last:border-b-0">
+									<code class="min-w-0 flex-1 truncate text-xs" title={imageReference}>{imageReference}</code>
+									<CopyButton text={imageReference} variant="outline" tabindex={0} />
+								</div>
+							{/if}
+						{/each}
+					{/if}
+				</div>
 			</Dialog.Content>
 		</Dialog.Root>
 	{/snippet}

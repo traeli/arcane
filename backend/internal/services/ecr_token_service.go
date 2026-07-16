@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -13,6 +14,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/common"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/models"
+	utilsregistry "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/registryauth"
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"go.getarcane.app/sys/crypto"
 )
 
@@ -118,13 +123,15 @@ func (s *ContainerRegistryService) ecrClientForRegistryInternal(ctx context.Cont
 	return ecr.NewFromConfig(cfg), nil
 }
 
-func (s *ContainerRegistryService) ListECRRepositories(ctx context.Context, registryID string) ([]string, error) {
+func (s *ContainerRegistryService) ListRegistryRepositories(ctx context.Context, registryID string) ([]string, error) {
 	reg, err := s.GetRegistryByID(ctx, registryID)
 	if err != nil {
 		return nil, err
 	}
 	if reg.RegistryType != registryTypeECR {
-		return nil, fmt.Errorf("repository discovery is supported for ECR registries only")
+		values := append([]string(nil), reg.RepositoryNames...)
+		slices.Sort(values)
+		return values, nil
 	}
 	client, err := s.ecrClientForRegistryInternal(ctx, reg)
 	if err != nil {
@@ -144,18 +151,44 @@ func (s *ContainerRegistryService) ListECRRepositories(ctx context.Context, regi
 		}
 		token = page.NextToken
 		if token == nil || *token == "" {
+			slices.Sort(values)
 			return values, nil
 		}
 	}
 }
 
-func (s *ContainerRegistryService) ListECRTags(ctx context.Context, registryID, repository string) ([]string, error) {
+func (s *ContainerRegistryService) ListRegistryTags(ctx context.Context, registryID, repository string) ([]string, error) {
 	reg, err := s.GetRegistryByID(ctx, registryID)
 	if err != nil {
 		return nil, err
 	}
+	repository = strings.TrimSpace(repository)
+	if repository == "" {
+		return nil, fmt.Errorf("repository is required")
+	}
 	if reg.RegistryType != registryTypeECR {
-		return nil, fmt.Errorf("tag discovery is supported for ECR registries only")
+		registryHost := utilsregistry.NormalizeRegistryForComparison(reg.URL)
+		repo, parseErr := name.NewRepository(registryHost+"/"+strings.Trim(repository, "/"), registryNameOptionsInternal(reg)...)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse registry repository: %w", parseErr)
+		}
+		remoteOptions := []remote.Option{remote.WithContext(ctx)}
+		if strings.TrimSpace(reg.Username) != "" && reg.Token != "" {
+			token, tokenErr := s.GetDecryptedToken(ctx, registryID)
+			if tokenErr != nil {
+				return nil, tokenErr
+			}
+			remoteOptions = append(remoteOptions, remote.WithAuth(authn.FromConfig(authn.AuthConfig{
+				Username: strings.TrimSpace(reg.Username),
+				Password: strings.TrimSpace(token),
+			})))
+		}
+		values, listErr := remote.List(repo, remoteOptions...)
+		if listErr != nil {
+			return nil, fmt.Errorf("list registry tags: %w", listErr)
+		}
+		slices.Sort(values)
+		return values, nil
 	}
 	client, err := s.ecrClientForRegistryInternal(ctx, reg)
 	if err != nil {
@@ -173,7 +206,16 @@ func (s *ContainerRegistryService) ListECRTags(ctx context.Context, registryID, 
 		}
 		token = page.NextToken
 		if token == nil || *token == "" {
+			slices.Sort(values)
 			return values, nil
 		}
 	}
+}
+
+func registryNameOptionsInternal(reg *models.ContainerRegistry) []name.Option {
+	options := []name.Option{name.WeakValidation}
+	if reg.Insecure {
+		options = append(options, name.Insecure)
+	}
+	return options
 }

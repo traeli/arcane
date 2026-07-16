@@ -1,0 +1,73 @@
+Port: "8080"
+Mode: "debug"
+Region: "cn"
+
+Redis:
+  Addr: "redis:6379"
+  Username: ""
+  Password: ""
+  Pool: 20
+  DB: 2
+  MinId: 1
+  TLSEnabled: false
+
+Mysql:
+  Host: "mysql_1"
+  Port: "3306"
+  Name: "root"
+  Password: "123456"
+  Db: "smart_wearables"
+  Charset: "utf8mb4"
+  Log: true
+
+OldMysql:
+  Host: "mysql_2"
+  Port: "3306"
+  Name: "root"
+  Password: "123456"
+  Db: "has"
+  Charset: "utf8mb4"
+  Log: true
+
+AuroraMysql:
+  Host: "mysql_1"
+  Port: "3306"
+  Name: "root"
+  Password: "123456"
+  Db: "smart_wearables"
+  Charset: "utf8mb4"
+  Log: true
+
+MongoDB:
+  Url: "mongodb://mongo1:27017/?replicaSet=rs0"
+  DB: "smart_wearables"
+
+InitModules:
+  - Mysql
+  - MongoDB
+  - Redis
+  - AuroraMysql
+
+RunComplianceBackfill: false
+HealthApiInternalToken: "test-health-internal-token-change-me"
+PaymentAdminInternalToken: "test-payment-admin-token-change-me"
+
+PushTasks:
+  - push_message_queue:device_event
+  - push_message_queue:menstrual
+  - push_message_queue:upgrade
+
+JWT:
+  Env: "cn"
+  PrivateKeyFile: "jwt-private.pem"
+  PublicKeyDir: "jwt-public-keys"
+  KeyID: "cn-2026-01"
+  AccessTokenTTL: 600
+  ExpectedAudience: "main-api"
+
+Payment:
+  Enabled: false
+  Providers: []
+  DefaultCurrency: "USD"
+  EnabledRegions: []
+  EnabledDomains: []

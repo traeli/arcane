@@ -1,0 +1,60 @@
+Port: "8081"
+Mode: "debug"
+Region: "cn"
+
+Redis:
+  Addr: "redis:6379"
+  Username: ""
+  Password: ""
+  Pool: 20
+  DB: 2
+  MinId: 1
+  TLSEnabled: false
+
+Mysql:
+  Host: "mysql_1"
+  Port: "3306"
+  Name: "root"
+  Password: "123456"
+  Db: "smart_wearables"
+  Charset: "utf8mb4"
+  Log: true
+
+OldMysql:
+  Host: "mysql_2"
+  Port: "3306"
+  Name: "root"
+  Password: "123456"
+  Db: "has"
+  Charset: "utf8mb4"
+  Log: true
+
+MongoDB:
+  Url: "mongodb://mongo1:27017/?replicaSet=rs0"
+  DB: "smart_wearables"
+
+Compliance:
+  RelaxConsentCheck: true
+  RelaxRegionCheck: true
+  AllowMigratedConsent: true
+  MigratedCountryCode: "cn"
+  CountryProfiles:
+    cn: "cn_pipl"
+  LocalCountryCode: "cn"
+  LocalHealthCluster: "cn-cluster-1"
+
+InitModules:
+  - MongoDB
+  - Redis
+
+JWT:
+  Env: "cn"
+  PublicKeyDir: "jwt-public-keys"
+  ExpectedAudience: "health-api"
+  CurrentCluster: "cn"
+
+InternalService:
+  Token: "test-health-internal-token-change-me"
+
+AccountService:
+  Domain: "http://main-service:8080"

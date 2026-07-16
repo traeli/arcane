@@ -148,14 +148,14 @@ func RegisterContainerRegistries(api huma.API, registryService *services.Contain
 
 	huma.Register(api, huma.Operation{
 		OperationID: "listContainerRegistryRepositories", Method: http.MethodGet,
-		Path: "/container-registries/{id}/repositories", Summary: "List ECR repositories",
+		Path: "/container-registries/{id}/repositories", Summary: "List registry repositories",
 		Tags: []string{"Container Registries"}, Security: defaultOperationSecurityInternal(),
 		Middlewares: humamw.RequirePermission(api, authz.PermRegistriesRead),
 	}, h.ListRepositories)
 
 	huma.Register(api, huma.Operation{
 		OperationID: "listContainerRegistryTags", Method: http.MethodGet,
-		Path: "/container-registries/{id}/tags", Summary: "List ECR image tags",
+		Path: "/container-registries/{id}/tags", Summary: "List registry image tags",
 		Tags: []string{"Container Registries"}, Security: defaultOperationSecurityInternal(),
 		Middlewares: humamw.RequirePermission(api, authz.PermRegistriesRead),
 	}, h.ListTags)
@@ -559,7 +559,7 @@ func (h *ContainerRegistryHandler) TestRemotePull(ctx context.Context, input *Te
 }
 
 func (h *ContainerRegistryHandler) ListRepositories(ctx context.Context, input *RegistryCatalogInput) (*RegistryRepositoriesOutput, error) {
-	values, err := h.registryService.ListECRRepositories(ctx, input.ID)
+	values, err := h.registryService.ListRegistryRepositories(ctx, input.ID)
 	if err != nil {
 		return nil, huma.Error400BadRequest(err.Error())
 	}
@@ -567,7 +567,7 @@ func (h *ContainerRegistryHandler) ListRepositories(ctx context.Context, input *
 }
 
 func (h *ContainerRegistryHandler) ListTags(ctx context.Context, input *RegistryTagsInput) (*RegistryTagsOutput, error) {
-	values, err := h.registryService.ListECRTags(ctx, input.ID, strings.TrimSpace(input.Repository))
+	values, err := h.registryService.ListRegistryTags(ctx, input.ID, strings.TrimSpace(input.Repository))
 	if err != nil {
 		return nil, huma.Error400BadRequest(err.Error())
 	}

@@ -903,6 +903,57 @@ func TestContainerRegistryService_CreateRegistry_PersistsRepositoryNames(t *test
 	assert.Equal(t, models.StringSlice{"team", "team/platform"}, fetched.RepositoryNames)
 }
 
+func TestContainerRegistryService_ListRegistryRepositories_GenericUsesConfiguredNames(t *testing.T) {
+	_, db := setupImageServiceAuthTest(t)
+	svc := NewContainerRegistryService(db, nil, nil)
+
+	reg, err := svc.CreateRegistry(context.Background(), models.CreateContainerRegistryRequest{
+		URL:             "https://registry.example.com",
+		Username:        "my-user",
+		Token:           "my-token",
+		RepositoryNames: []string{"team/zeta", "team/alpha"},
+	})
+	require.NoError(t, err)
+
+	repositories, err := svc.ListRegistryRepositories(context.Background(), reg.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"team/alpha", "team/zeta"}, repositories)
+}
+
+func TestContainerRegistryService_ListRegistryTags_GenericUsesStoredCredentials(t *testing.T) {
+	_, db := setupImageServiceAuthTest(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2/" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		assert.Equal(t, "/v2/team/app/tags/list", r.URL.Path)
+		username, password, ok := r.BasicAuth()
+		assert.True(t, ok)
+		assert.Equal(t, "my-user", username)
+		assert.Equal(t, "my-token", password)
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"name": "team/app", "tags": []string{"v2", "latest"}}))
+	}))
+	defer server.Close()
+
+	insecure := true
+	svc := NewContainerRegistryService(db, nil, nil)
+	reg, err := svc.CreateRegistry(context.Background(), models.CreateContainerRegistryRequest{
+		URL:             server.URL,
+		Username:        "my-user",
+		Token:           "my-token",
+		Insecure:        &insecure,
+		RepositoryNames: []string{"team/app"},
+	})
+	require.NoError(t, err)
+
+	tags, err := svc.ListRegistryTags(context.Background(), reg.ID, "team/app")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"latest", "v2"}, tags)
+}
+
 func TestContainerRegistryService_CreateRegistry_NormalizesRepositoryNames(t *testing.T) {
 	_, db := setupImageServiceAuthTest(t)
 	svc := NewContainerRegistryService(db, nil, nil)

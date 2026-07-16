@@ -78,6 +78,13 @@
 		return m.registries_status_not_synced();
 	}
 
+	function formatPullTestStatus(item: ContainerRegistry) {
+		const status = environmentStatuses[item.id]?.pullTestStatus;
+		if (status === 'success') return m.registries_pull_status_allowed();
+		if (status === 'failed') return m.registries_pull_status_denied();
+		return m.registries_pull_status_not_tested();
+	}
+
 	async function handleDeleteSelected(ids: string[]) {
 		if (!ids?.length) return;
 
@@ -265,7 +272,15 @@
 {/snippet}
 
 {#snippet EnvironmentStatusCell({ item }: { item: ContainerRegistry })}
-	<span class="text-sm" title={environmentStatuses[item.id]?.lastSyncError ?? ''}>{formatEnvironmentStatus(item)}</span>
+	<div
+		class="flex flex-col text-sm"
+		title={environmentStatuses[item.id]?.lastPullTestError || environmentStatuses[item.id]?.lastSyncError || ''}
+	>
+		<span>{formatEnvironmentStatus(item)}</span>
+		{#if selectedEnvironmentId !== '0'}
+			<span class="text-muted-foreground text-xs">{formatPullTestStatus(item)}</span>
+		{/if}
+	</div>
 {/snippet}
 
 {#snippet RegistryMobileCardSnippet({
