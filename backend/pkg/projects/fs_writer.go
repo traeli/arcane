@@ -1,6 +1,7 @@
 package projects
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,7 +13,86 @@ import (
 
 	pkgutils "github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
 	"go.getarcane.app/sys/atomic"
+	"gopkg.in/yaml.v3"
 )
+
+// UpdateComposeServiceImages updates image fields for existing Compose services
+// while preserving the rest of the YAML document.
+func UpdateComposeServiceImages(content string, imageUpdates map[string]string) (string, error) {
+	if len(imageUpdates) == 0 {
+		return content, nil
+	}
+
+	var document yaml.Node
+	if err := yaml.Unmarshal([]byte(content), &document); err != nil {
+		return "", fmt.Errorf("parse compose YAML: %w", err)
+	}
+	if len(document.Content) == 0 || document.Content[0].Kind != yaml.MappingNode {
+		return "", errors.New("compose YAML root must be a mapping")
+	}
+
+	services := yamlMappingValueInternal(document.Content[0], "services")
+	if services == nil || services.Kind != yaml.MappingNode {
+		return "", errors.New("compose YAML does not contain a services mapping")
+	}
+
+	remaining := make(map[string]string, len(imageUpdates))
+	for service, imageRef := range imageUpdates {
+		service = strings.TrimSpace(service)
+		imageRef = strings.TrimSpace(imageRef)
+		if service == "" || imageRef == "" {
+			return "", errors.New("service name and image reference are required")
+		}
+		remaining[service] = imageRef
+	}
+
+	for index := 0; index+1 < len(services.Content); index += 2 {
+		serviceName := services.Content[index].Value
+		imageRef, ok := remaining[serviceName]
+		if !ok {
+			continue
+		}
+		serviceNode := services.Content[index+1]
+		if serviceNode.Kind != yaml.MappingNode {
+			return "", fmt.Errorf("compose service %s must be a mapping", serviceName)
+		}
+		imageNode := yamlMappingValueInternal(serviceNode, "image")
+		if imageNode == nil {
+			serviceNode.Content = append(serviceNode.Content,
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "image"},
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: imageRef},
+			)
+		} else {
+			imageNode.Kind = yaml.ScalarNode
+			imageNode.Tag = "!!str"
+			imageNode.Value = imageRef
+		}
+		delete(remaining, serviceName)
+	}
+	for service := range remaining {
+		return "", fmt.Errorf("compose service %s was not found", service)
+	}
+
+	var output bytes.Buffer
+	encoder := yaml.NewEncoder(&output)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&document); err != nil {
+		return "", fmt.Errorf("encode compose YAML: %w", err)
+	}
+	return output.String(), nil
+}
+
+func yamlMappingValueInternal(mapping *yaml.Node, key string) *yaml.Node {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return nil
+	}
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		if mapping.Content[index].Value == key {
+			return mapping.Content[index+1]
+		}
+	}
+	return nil
+}
 
 // DefaultComposeFileName is the compose filename Arcane writes when a project
 // has no existing compose file.

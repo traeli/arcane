@@ -113,7 +113,8 @@ func (s *ProjectService) resolveRegistryCredentialsInternal(ctx context.Context)
 
 	credentials, err := s.registryCredentialsProvider(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("get enabled registry credentials: %w", err)
+		slog.WarnContext(ctx, "failed to load synchronized registry credentials; image pulls will use agent-local credentials", "error", err)
+		return nil, nil
 	}
 
 	return credentials, nil
@@ -774,55 +775,97 @@ func writeProjectProgressInternal(ctx context.Context, message string, progress 
 	}
 }
 
-func (s *ProjectService) UpdateProjectServices(ctx context.Context, projectID string, servicesToUpdate []string, user models.User) error {
+func (s *ProjectService) UpdateProjectServices(ctx context.Context, projectID string, servicesToUpdate []string, imageUpdates map[string]string, user models.User) error {
 	projectFromDb, err := s.GetProjectFromDatabaseByID(ctx, projectID)
 	if err != nil {
 		return err
 	}
-	previousStatus := projectFromDb.Status
 
-	// 1. Load project
 	compProj, _, err := s.loadComposeProjectForProjectInternal(ctx, projectFromDb, nil)
 	if err != nil {
 		return fmt.Errorf("failed to load compose project: %w", err)
 	}
 
-	// 2. Set status to deploying/restarting
-	if err := s.updateProjectStatusInternal(ctx, projectID, models.ProjectStatusDeploying); err != nil {
-		return err
+	if len(imageUpdates) > 0 {
+		if len(servicesToUpdate) == 0 {
+			servicesToUpdate = make([]string, 0, len(imageUpdates))
+			for serviceName := range imageUpdates {
+				servicesToUpdate = append(servicesToUpdate, serviceName)
+			}
+			slices.Sort(servicesToUpdate)
+		}
+		for serviceName, imageRef := range imageUpdates {
+			serviceConfig, ok := compProj.Services[serviceName]
+			if !ok {
+				return fmt.Errorf("compose service %s was not found", serviceName)
+			}
+			serviceConfig.Image = strings.TrimSpace(imageRef)
+			if serviceConfig.Image == "" {
+				return fmt.Errorf("image reference is required for service %s", serviceName)
+			}
+			compProj.Services[serviceName] = serviceConfig
+		}
 	}
 
 	credentials, err := s.resolveRegistryCredentialsInternal(ctx)
 	if err != nil {
-		if statusErr := s.updateProjectStatusInternal(ctx, projectID, previousStatus); statusErr != nil {
-			slog.ErrorContext(ctx, "UpdateProjectServices: failed to restore project status after credential lookup failure", "projectID", projectID, "error", statusErr)
-		}
 		return fmt.Errorf("resolve registry credentials: %w", err)
 	}
 
-	// 3. Pull images for specific services
+	// Pull before changing project files or recreating any service.
 	writeProjectProgressInternal(ctx, "Pulling updated service images", 20, "pull")
 	if err := s.composePullSelectedServicesInternal(ctx, compProj, servicesToUpdate, user, credentials); err != nil {
-		if statusErr := s.updateProjectStatusInternal(ctx, projectID, previousStatus); statusErr != nil {
-			slog.ErrorContext(ctx, "UpdateProjectServices: failed to restore project status after compose pull failure", "projectID", projectID, "error", statusErr)
-		}
 		return fmt.Errorf("pull updated service images: %w", err)
 	}
 
-	// 4. Stop specific services
-	writeProjectProgressInternal(ctx, "Stopping selected services", 45, "stop")
-	if err := composeStopProjectServicesInternal(ctx, compProj, servicesToUpdate); err != nil {
-		slog.WarnContext(ctx, "compose stop failed, continuing", "error", err)
+	var originalComposeContent string
+	if len(imageUpdates) > 0 {
+		originalComposeContent, _, _, err = s.GetProjectContent(ctx, projectID)
+		if err != nil {
+			return fmt.Errorf("read project compose content: %w", err)
+		}
+		updatedComposeContent, updateErr := projects.UpdateComposeServiceImages(originalComposeContent, imageUpdates)
+		if updateErr != nil {
+			return updateErr
+		}
+		if _, updateErr = s.UpdateProject(ctx, projectID, nil, &updatedComposeContent, nil, nil, nil, nil, user); updateErr != nil {
+			return fmt.Errorf("save updated service images: %w", updateErr)
+		}
+		compProj, _, err = s.loadComposeProjectForProjectInternal(ctx, projectFromDb, nil)
+		if err != nil {
+			return fmt.Errorf("reload updated compose project: %w", err)
+		}
 	}
 
-	// 5. Up specific services
+	if err := s.updateProjectStatusInternal(ctx, projectID, models.ProjectStatusDeploying); err != nil {
+		return err
+	}
+	servicesForLocalImages := servicesToUpdate
+	if len(servicesForLocalImages) == 0 {
+		servicesForLocalImages = make([]string, 0, len(compProj.Services))
+		for serviceName := range compProj.Services {
+			servicesForLocalImages = append(servicesForLocalImages, serviceName)
+		}
+	}
+	for _, serviceName := range servicesForLocalImages {
+		serviceConfig, ok := compProj.Services[serviceName]
+		if ok && serviceConfig.Build == nil {
+			serviceConfig.PullPolicy = composetypes.PullPolicyNever
+			compProj.Services[serviceName] = serviceConfig
+		}
+	}
+
 	writeProjectProgressInternal(ctx, "Starting selected services", 70, "up")
 	if err := composeUpProjectServicesInternal(ctx, compProj, servicesToUpdate, false, true, s.composeRegistryAuthConfigsInternal(ctx)); err != nil {
+		if originalComposeContent != "" {
+			if _, rollbackErr := s.UpdateProject(ctx, projectID, nil, &originalComposeContent, nil, nil, nil, nil, user); rollbackErr != nil {
+				slog.ErrorContext(ctx, "failed to roll back compose image update", "projectID", projectID, "error", rollbackErr)
+			}
+		}
 		s.restoreProjectStatusAfterFailedDeployInternal(ctx, projectID)
 		return fmt.Errorf("failed to up services: %w", err)
 	}
 
-	// 6. Finalize status
 	writeProjectProgressInternal(ctx, "Refreshing project status", 90, "status")
 	if err := s.updateProjectStatusandCountsInternal(ctx, projectID, models.ProjectStatusRunning); err != nil {
 		return err
@@ -830,10 +873,11 @@ func (s *ProjectService) UpdateProjectServices(ctx context.Context, projectID st
 	writeProjectProgressInternal(ctx, "Service update completed", 100, "complete")
 
 	metadata := models.JSON{
-		"action":      "update_services",
-		"projectID":   projectID,
-		"projectName": projectFromDb.Name,
-		"services":    append([]string(nil), servicesToUpdate...),
+		"action":       "update_services",
+		"projectID":    projectID,
+		"projectName":  projectFromDb.Name,
+		"services":     append([]string(nil), servicesToUpdate...),
+		"imageUpdates": imageUpdates,
 	}
 	s.logProjectEventInternal(ctx, models.EventTypeProjectUpdate, projectID, projectFromDb.Name, user, metadata, "could not log project service update action")
 
@@ -2540,6 +2584,10 @@ func (s *ProjectService) prepareProjectImagesForDeploy(
 		}
 		if err := s.ensureDeployServiceImageReady(ctx, projectID, project, name, svc, imageName, decision, progressWriter, credentials, user); err != nil {
 			return err
+		}
+		if !decision.Build {
+			svc.PullPolicy = composetypes.PullPolicyNever
+			project.Services[name] = svc
 		}
 	}
 

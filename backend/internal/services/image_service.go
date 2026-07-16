@@ -180,6 +180,9 @@ func (s *ImageService) PullImage(ctx context.Context, imageName string, progress
 
 	pullOptions, err := s.getPullOptionsWithAuth(ctx, imageName, externalCreds)
 	if err != nil {
+		if isECRRegistryHostInternal(utilsregistry.ExtractRegistryHost(imageName)) {
+			return fmt.Errorf("failed to resolve ECR authentication for %s: %w", imageName, err)
+		}
 		slog.WarnContext(ctx, "Failed to get registry authentication for image; proceeding without auth", "image", imageName, "error", err.Error())
 		pullOptions = client.ImagePullOptions{}
 	}
@@ -188,7 +191,7 @@ func (s *ImageService) PullImage(ctx context.Context, imageName string, progress
 	retriedWithoutAuth := false
 
 	reader, err := dockerClient.ImagePull(ctx, imageName, pullOptions)
-	if err != nil && shouldRetryAnonymousPullInternal(pullOptions, err) {
+	if err != nil && !isECRRegistryHostInternal(utilsregistry.ExtractRegistryHost(imageName)) && shouldRetryAnonymousPullInternal(pullOptions, err) {
 		retriedWithoutAuth = true
 		slog.WarnContext(ctx, "Docker ImagePull failed with registry auth; retrying anonymously", "image", imageName, "error", err.Error())
 		pullOptions = client.ImagePullOptions{}
@@ -469,8 +472,22 @@ func (s *ImageService) getPullOptionsWithAuth(ctx context.Context, imageRef stri
 		}
 	}
 
+	// ECR pulls on an agent use the AWS credential chain local to that agent.
+	// This path deliberately runs before the registry database lookup so an agent
+	// does not depend on manager-to-agent credential synchronization.
+	var localECRErr error
+	if authStr, matched, err := getLocalECRAuthHeaderInternal(ctx, registryHost); matched {
+		if err == nil {
+			pullOptions.RegistryAuth = authStr
+			slog.DebugContext(ctx, "Using local AWS credentials for ECR image pull", "registry", registryHost)
+			return pullOptions, nil
+		}
+		localECRErr = err
+		slog.WarnContext(ctx, "Local AWS credentials could not authenticate ECR pull; trying configured registry credentials", "registry", registryHost, "error", err)
+	}
+
 	if s.registryService == nil {
-		return pullOptions, nil
+		return pullOptions, localECRErr
 	}
 
 	authStr, err := s.registryService.GetRegistryAuthForHost(ctx, registryHost)
@@ -480,6 +497,9 @@ func (s *ImageService) getPullOptionsWithAuth(ctx context.Context, imageRef stri
 	if authStr != "" {
 		pullOptions.RegistryAuth = authStr
 		slog.DebugContext(ctx, "Using database credentials for image pull", "registry", registryHost)
+	}
+	if localECRErr != nil {
+		return pullOptions, localECRErr
 	}
 
 	return pullOptions, nil

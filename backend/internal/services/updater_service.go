@@ -625,7 +625,7 @@ func (s *UpdaterService) UpdateServices(ctx context.Context, projectID string, s
 	if s == nil || s.deps.Projects == nil {
 		return &common.UpdaterProjectServiceUnavailableError{}
 	}
-	return s.deps.Projects.UpdateProjectServices(ctx, projectID, services, s.deps.SystemUser)
+	return s.deps.Projects.UpdateProjectServices(ctx, projectID, services, nil, s.deps.SystemUser)
 }
 
 // TriggerSelfUpdate runs Arcane's CLI-backed self-update hook.

@@ -166,7 +166,8 @@ type UpdateProjectServicesInput struct {
 	EnvironmentID string `path:"id" doc:"Environment ID"`
 	ProjectID     string `path:"projectId" doc:"Project ID"`
 	Body          *struct {
-		Services []string `json:"services,omitempty" doc:"Service names to update; empty updates all services"`
+		Services     []string          `json:"services,omitempty" doc:"Service names to update; empty updates all services"`
+		ImageUpdates map[string]string `json:"imageUpdates,omitempty" doc:"New image reference keyed by service name"`
 	}
 }
 
@@ -1066,11 +1067,13 @@ func (h *ProjectHandler) RestartProject(ctx context.Context, input *RestartProje
 // UpdateProjectServices pulls the latest images for the given services and recreates them.
 func (h *ProjectHandler) UpdateProjectServices(ctx context.Context, input *UpdateProjectServicesInput) (*UpdateProjectServicesOutput, error) {
 	var services []string
+	var imageUpdates map[string]string
 	if input.Body != nil {
 		services = input.Body.Services
+		imageUpdates = input.Body.ImageUpdates
 	}
 
-	response, err := h.runProjectActivityActionResponseInternal(ctx, input.EnvironmentID, input.ProjectID, h.updateProjectServicesActivityConfigInternal(services))
+	response, err := h.runProjectActivityActionResponseInternal(ctx, input.EnvironmentID, input.ProjectID, h.updateProjectServicesActivityConfigInternal(services, imageUpdates))
 	if err != nil {
 		return nil, err
 	}
@@ -1110,7 +1113,7 @@ func (h *ProjectHandler) redeployProjectActivityConfigInternal(options *project.
 	}
 }
 
-func (h *ProjectHandler) updateProjectServicesActivityConfigInternal(services []string) projectActivityActionConfigInternal {
+func (h *ProjectHandler) updateProjectServicesActivityConfigInternal(services []string, imageUpdates map[string]string) projectActivityActionConfigInternal {
 	return projectActivityActionConfigInternal{
 		ActivityType:    models.ActivityTypeAutoUpdate,
 		Step:            "Updating project services",
@@ -1120,7 +1123,7 @@ func (h *ProjectHandler) updateProjectServicesActivityConfigInternal(services []
 		SuccessComplete: "Project services updated",
 		SuccessMessage:  "Project services updated successfully",
 		Action: func(runtimeCtx context.Context, projectID string, user models.User) error {
-			return h.projectService.UpdateProjectServices(runtimeCtx, projectID, services, user)
+			return h.projectService.UpdateProjectServices(runtimeCtx, projectID, services, imageUpdates, user)
 		},
 		Error: projectArchivedActionErrorInternal(func(err error) error {
 			return huma.Error400BadRequest((&common.ProjectUpdateError{Err: err}).Error())

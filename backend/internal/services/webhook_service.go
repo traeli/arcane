@@ -658,7 +658,7 @@ func (s *WebhookService) syncWebhookContainerTargetInternal(ctx context.Context,
 func (s *WebhookService) executeProjectWebhookActionInternal(ctx context.Context, wh *models.Webhook, actionType string) (*updater.Result, error) {
 	switch actionType {
 	case models.WebhookActionTypeUpdate:
-		if err := s.projectService.UpdateProjectServices(ctx, wh.TargetID, nil, systemUser); err != nil {
+		if err := s.projectService.UpdateProjectServices(ctx, wh.TargetID, nil, nil, systemUser); err != nil {
 			return nil, s.wrapWebhookActionErrorInternal(ctx, wh, "project", actionType, err)
 		}
 		return nil, nil

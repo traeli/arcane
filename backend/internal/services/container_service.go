@@ -496,7 +496,7 @@ func (s *ContainerService) tryRedeployViaComposeProjectInternal(ctx context.Cont
 		"service", serviceName,
 	)
 
-	if err := s.projectService.UpdateProjectServices(ctx, proj.ID, []string{serviceName}, user); err != nil {
+	if err := s.projectService.UpdateProjectServices(ctx, proj.ID, []string{serviceName}, nil, user); err != nil {
 		s.eventService.LogErrorEvent(ctx, models.EventTypeContainerError, "container", containerID, containerName, user.ID, user.Username, "0", err, models.JSON{
 			"action":      "redeploy",
 			"step":        "compose_update_services",

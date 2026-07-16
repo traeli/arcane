@@ -912,6 +912,7 @@ func TestProjectService_UpdateProjectServicesHardFailsWhenPullFailsInternal(t *t
 	require.NoError(t, settingsService.SetStringSetting(ctx, "projectsDirectory", projectsDir))
 
 	imageRef := "registry.example.com/team/app:9.9.9"
+	updatedImageRef := "registry.example.com/team/app:10.0.0"
 	failingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/images/create") {
 			http.Error(w, "compose pull failed", http.StatusUnauthorized)
@@ -957,10 +958,14 @@ func TestProjectService_UpdateProjectServicesHardFailsWhenPullFailsInternal(t *t
 	}
 
 	svc := NewProjectService(db, settingsService, nil, imageService, dockerService, nil, nil, nil, config.Load())
-	err = svc.UpdateProjectServices(ctx, projectRecord.ID, []string{"app"}, systemUser)
+	err = svc.UpdateProjectServices(ctx, projectRecord.ID, []string{"app"}, map[string]string{"app": updatedImageRef}, systemUser)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "pull updated service images")
 	assert.False(t, upCalled, "compose up must not run after a pull failure")
+	persistedCompose, readErr := os.ReadFile(filepath.Join(projectPath, "compose.yaml"))
+	require.NoError(t, readErr)
+	assert.Contains(t, string(persistedCompose), imageRef)
+	assert.NotContains(t, string(persistedCompose), updatedImageRef)
 
 	var persistedProject models.Project
 	require.NoError(t, db.WithContext(ctx).Where("id = ?", projectRecord.ID).First(&persistedProject).Error)
@@ -982,14 +987,15 @@ func TestProjectService_UpdateProjectServicesForcesRecreateInternal(t *testing.T
 	require.NoError(t, settingsService.SetStringSetting(ctx, "projectsDirectory", projectsDir))
 
 	imageRef := "registry.example.com/team/app:9.9.9"
+	updatedImageRef := "registry.example.com/team/app:10.0.0"
 	repository := "registry.example.com/team/app"
 	imageID := "sha256:project-update-force"
 	imageDigest := digest.FromString("project-update-force-digest").String()
 
 	server := newProjectImagePullServer(t, map[string]dockertypesimage.InspectResponse{
-		imageRef: {
+		updatedImageRef: {
 			ID:          imageID,
-			RepoTags:    []string{imageRef},
+			RepoTags:    []string{updatedImageRef},
 			RepoDigests: []string{repository + "@" + imageDigest},
 		},
 	})
@@ -1010,30 +1016,31 @@ func TestProjectService_UpdateProjectServicesForcesRecreateInternal(t *testing.T
 	}
 	require.NoError(t, db.Create(projectRecord).Error)
 
-	originalComposeStop := composeStopProjectServicesInternal
 	originalComposeUp := composeUpProjectServicesInternal
 	t.Cleanup(func() {
-		composeStopProjectServicesInternal = originalComposeStop
 		composeUpProjectServicesInternal = originalComposeUp
 	})
-	composeStopProjectServicesInternal = func(context.Context, *composetypes.Project, []string) error {
-		return nil
-	}
 	upCalled := false
 	forceRecreate := false
-	composeUpProjectServicesInternal = func(_ context.Context, _ *composetypes.Project, services []string, removeOrphans bool, force bool, _ map[string]dockerregistry.AuthConfig) error {
+	composeUpProjectServicesInternal = func(_ context.Context, project *composetypes.Project, services []string, removeOrphans bool, force bool, _ map[string]dockerregistry.AuthConfig) error {
 		upCalled = true
 		forceRecreate = force
 		assert.Equal(t, []string{"app"}, services)
 		assert.False(t, removeOrphans)
+		assert.Equal(t, updatedImageRef, project.Services["app"].Image)
+		assert.Equal(t, composetypes.PullPolicyNever, project.Services["app"].PullPolicy)
 		return errors.New("compose up failed after assertion")
 	}
 
 	svc := NewProjectService(db, settingsService, nil, imageService, dockerService, nil, nil, nil, config.Load())
-	err = svc.UpdateProjectServices(ctx, projectRecord.ID, []string{"app"}, systemUser)
+	err = svc.UpdateProjectServices(ctx, projectRecord.ID, []string{"app"}, map[string]string{"app": updatedImageRef}, systemUser)
 	require.Error(t, err)
 	assert.True(t, upCalled)
 	assert.True(t, forceRecreate, "service updates must force recreate after pulling the updated image")
+	persistedCompose, readErr := os.ReadFile(filepath.Join(projectPath, "compose.yaml"))
+	require.NoError(t, readErr)
+	assert.Contains(t, string(persistedCompose), imageRef)
+	assert.NotContains(t, string(persistedCompose), updatedImageRef, "failed compose up must restore the previous image reference")
 }
 
 type fakeProjectVolumeRenameMigrationInternal struct {

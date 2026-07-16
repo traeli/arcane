@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -199,6 +200,30 @@ func TestGetPullOptionsWithAuth_ExternalCredentialsOverrideDBRegistryInternal(t 
 	assert.Equal(t, "external-user", authCfg.Username)
 	assert.Equal(t, "external-token", authCfg.Password)
 	assert.Equal(t, "registry.example.com", authCfg.ServerAddress)
+}
+
+func TestGetPullOptionsWithAuth_UsesAgentLocalECRCredentialsInternal(t *testing.T) {
+	const registryHost = "123456789012.dkr.ecr.us-west-2.amazonaws.com"
+	token := base64.StdEncoding.EncodeToString([]byte("AWS:local-ecr-password"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-amz-json-1.1")
+		_, _ = w.Write([]byte(`{"authorizationData":[{"authorizationToken":"` + token + `","proxyEndpoint":"https://` + registryHost + `"}]}`))
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("AWS_ACCESS_KEY_ID", "local-access-key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "local-secret-key")
+	t.Setenv("AWS_REGION", "us-west-2")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	t.Setenv("AWS_ENDPOINT_URL_ECR", server.URL)
+
+	svc := &ImageService{}
+	pullOptions, err := svc.getPullOptionsWithAuth(context.Background(), registryHost+"/team/api:v2", nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, pullOptions.RegistryAuth)
+	authCfg := decodeRegistryAuth(t, pullOptions.RegistryAuth)
+	assert.Equal(t, "AWS", authCfg.Username)
+	assert.Equal(t, "local-ecr-password", authCfg.Password)
+	assert.Equal(t, registryHost, authCfg.ServerAddress)
 }
 
 func TestImageServicePullImageRetriesAnonymouslyAfterAuthRejectedInternal(t *testing.T) {

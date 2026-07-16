@@ -1,7 +1,9 @@
 <script lang="ts">
 	import ArcaneTable from '$lib/components/arcane-table/arcane-table.svelte';
 	import { ArcaneButton } from '$lib/components/arcane-button/index.js';
+	import RegistryImageSelector from '$lib/components/compose/registry-image-selector.svelte';
 	import { Spinner } from '$lib/components/ui/spinner/index.js';
+	import * as Dialog from '$lib/components/ui/dialog/index.js';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
 	import RowActionsMenu from '$lib/components/arcane-table/row-actions-menu.svelte';
 	import ContainerActionMenuItem from '$lib/components/arcane-table/cells/container-action-menu-item.svelte';
@@ -52,6 +54,7 @@
 	const canStopContainer = $derived(hasPermission('containers:stop', currentEnvId));
 	const canRestartContainer = $derived(hasPermission('containers:restart', currentEnvId));
 	const canRestartProject = $derived(hasPermission('projects:restart', currentEnvId));
+	const canUpdateProject = $derived(hasPermission('projects:update', currentEnvId));
 	const canDeleteContainer = $derived(hasPermission('containers:delete', currentEnvId));
 
 	// Convert RuntimeService to a format compatible with ArcaneTable
@@ -65,8 +68,11 @@
 	);
 
 	// Track action status per container ID
-	type ActionStatus = 'starting' | 'stopping' | 'restarting' | 'pausing' | 'unpausing' | 'removing' | '';
+	type ActionStatus = 'starting' | 'stopping' | 'restarting' | 'pausing' | 'unpausing' | 'removing' | 'updating' | '';
 	let actionStatus = $state<Record<string, ActionStatus>>({});
+	let imageDialogOpen = $state(false);
+	let imageService = $state<ServiceWithId | undefined>();
+	let selectedImage = $state('');
 
 	let isBulkLoading = $state({
 		start: false,
@@ -145,6 +151,36 @@
 			console.error('Service restart failed:', error);
 			toast.error(m.containers_action_error());
 			actionStatus[id] = '';
+		}
+	}
+
+	function openImageDialog(item: ServiceWithId) {
+		imageService = item;
+		selectedImage = '';
+		imageDialogOpen = true;
+	}
+
+	async function updateServiceImage() {
+		if (!projectId || !imageService || !selectedImage) return;
+		const item = imageService;
+		actionStatus[item.id] = 'updating';
+		try {
+			handleApiResultWithCallbacks({
+				result: await tryCatch(projectService.updateProjectServices(projectId, [item.name], { [item.name]: selectedImage })),
+				message: m.project_service_image_update_failed(),
+				setLoadingState: (value) => {
+					actionStatus[item.id] = value ? 'updating' : '';
+				},
+				async onSuccess(data) {
+					imageDialogOpen = false;
+					toast.success(m.project_service_image_update_started(), activityToastOptions(extractActivityId(data)));
+					await onRefresh?.();
+				}
+			});
+		} catch (error) {
+			console.error('Service image update failed:', error);
+			toast.error(m.project_service_image_update_failed());
+			actionStatus[item.id] = '';
 		}
 	}
 
@@ -244,7 +280,7 @@
 	const columns = [
 		{ accessorKey: 'containerName', id: 'name', title: m.common_name(), sortable: true, cell: NameCell },
 		{ accessorKey: 'status', title: m.common_state(), cell: StateCell },
-		{ accessorKey: 'image', title: m.common_image() },
+		{ accessorKey: 'image', title: m.common_image(), cell: ImageCell },
 		{ accessorKey: 'health', title: m.common_health_status(), cell: HealthCell },
 		{ accessorKey: 'ports', title: m.common_ports(), cell: PortsCell }
 	] satisfies ColumnSpec<ServiceWithId>[];
@@ -311,6 +347,22 @@
 	</div>
 {/snippet}
 
+{#snippet ImageCell({ item }: { item: ServiceWithId })}
+	{#if canUpdateProject && projectId}
+		<button
+			type="button"
+			class="max-w-[48rem] truncate text-left hover:text-primary hover:underline disabled:pointer-events-none"
+			onclick={() => openImageDialog(item)}
+			disabled={isAnyLoading}
+			title={m.project_service_image_change()}
+		>
+			{item.image}
+		</button>
+	{:else}
+		<span>{item.image}</span>
+	{/if}
+{/snippet}
+
 {#snippet StateCell({ item }: { item: ServiceWithId })}
 	{@const status = actionStatus[item.id]}
 	{#if status}
@@ -323,7 +375,9 @@
 						? m.common_action_stopping()
 						: status === 'restarting'
 							? m.common_action_restarting()
-							: m.common_action_removing()}
+							: status === 'updating'
+								? m.project_service_image_updating()
+								: m.common_action_removing()}
 			</span>
 		</div>
 	{:else}
@@ -544,3 +598,34 @@
 		</Empty.Root>
 	</div>
 {/if}
+
+<Dialog.Root bind:open={imageDialogOpen}>
+	<Dialog.Content class="sm:max-w-3xl">
+		<Dialog.Header>
+			<Dialog.Title>{m.project_service_image_change()}</Dialog.Title>
+			<Dialog.Description>
+				{m.project_service_image_change_description({ service: imageService?.name ?? '' })}
+			</Dialog.Description>
+		</Dialog.Header>
+		<div class="space-y-4 py-2">
+			<div class="text-muted-foreground text-sm">
+				{m.project_service_image_current({ image: imageService?.image ?? '' })}
+			</div>
+			<RegistryImageSelector
+				bind:selectedImage
+				idPrefix="project-service-image"
+				disabled={imageService ? actionStatus[imageService.id] === 'updating' : false}
+			/>
+		</div>
+		<Dialog.Footer>
+			<ArcaneButton action="base" tone="outline" customLabel={m.common_cancel()} onclick={() => (imageDialogOpen = false)} />
+			<ArcaneButton
+				action="base"
+				customLabel={m.project_service_image_pull_and_update()}
+				onclick={updateServiceImage}
+				disabled={!selectedImage || (imageService ? actionStatus[imageService.id] === 'updating' : false)}
+				loading={imageService ? actionStatus[imageService.id] === 'updating' : false}
+			/>
+		</Dialog.Footer>
+	</Dialog.Content>
+</Dialog.Root>

@@ -261,3 +261,23 @@ func TestWriteComposeFile_PreservesExistingCustomComposeNames(t *testing.T) {
 	_, err = os.Stat(filepath.Join(projectDir, "compose.yaml"))
 	assert.True(t, os.IsNotExist(err), "compose.yaml should not be created when an existing custom compose file is present")
 }
+
+func TestUpdateComposeServiceImages(t *testing.T) {
+	content := "name: sample\nservices:\n  api:\n    image: old.example/api:v1\n    environment:\n      MODE: production\n  worker:\n    command: run\n"
+
+	updated, err := UpdateComposeServiceImages(content, map[string]string{
+		"api":    "123456789012.dkr.ecr.us-west-2.amazonaws.com/api:v2",
+		"worker": "123456789012.dkr.ecr.us-west-2.amazonaws.com/worker:v2",
+	})
+	require.NoError(t, err)
+	require.Contains(t, updated, "image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/api:v2")
+	require.Contains(t, updated, "image: 123456789012.dkr.ecr.us-west-2.amazonaws.com/worker:v2")
+	require.Contains(t, updated, "MODE: production")
+	require.Contains(t, updated, "command: run")
+	require.NotContains(t, updated, "old.example/api:v1")
+}
+
+func TestUpdateComposeServiceImagesRejectsUnknownService(t *testing.T) {
+	_, err := UpdateComposeServiceImages("services:\n  api:\n    image: api:v1\n", map[string]string{"missing": "api:v2"})
+	require.ErrorContains(t, err, "compose service missing was not found")
+}

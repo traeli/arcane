@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -23,9 +24,59 @@ import (
 
 const ecrTokenTTL = 12 * time.Hour
 
+var ecrRegistryHostPatternInternal = regexp.MustCompile(`^(\d{12})\.dkr\.ecr(?:-fips)?\.([a-z0-9-]+)\.amazonaws\.com(?:\.cn)?$`)
+
+func isECRRegistryHostInternal(registryHost string) bool {
+	host := utilsregistry.NormalizeRegistryForComparison(registryHost)
+	return ecrRegistryHostPatternInternal.MatchString(host)
+}
+
 type ecrTokenResult struct {
 	username string
 	password string
+}
+
+// getLocalECRAuthHeaderInternal resolves ECR credentials from the standard AWS
+// credential chain available to this process. It intentionally does not read or
+// write Arcane's registry database, which lets headless agents authenticate with
+// credentials supplied through environment variables, shared credential files,
+// workload identity, or an instance role.
+func getLocalECRAuthHeaderInternal(ctx context.Context, registryHost string) (string, bool, error) {
+	host := utilsregistry.NormalizeRegistryForComparison(registryHost)
+	matches := ecrRegistryHostPatternInternal.FindStringSubmatch(host)
+	if len(matches) != 3 {
+		return "", false, nil
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(matches[2]))
+	if err != nil {
+		return "", true, fmt.Errorf("load local AWS credentials for %s: %w", host, err)
+	}
+
+	result, err := ecr.NewFromConfig(cfg).GetAuthorizationToken(ctx, &ecr.GetAuthorizationTokenInput{
+		RegistryIds: []string{matches[1]},
+	})
+	if err != nil {
+		return "", true, fmt.Errorf("get ECR authorization token for %s: %w", host, err)
+	}
+	if len(result.AuthorizationData) == 0 || result.AuthorizationData[0].AuthorizationToken == nil {
+		return "", true, fmt.Errorf("ECR returned empty authorization data for %s", host)
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(*result.AuthorizationData[0].AuthorizationToken)
+	if err != nil {
+		return "", true, fmt.Errorf("decode ECR authorization token for %s: %w", host, err)
+	}
+	parts := strings.SplitN(string(decoded), ":", 2)
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || parts[1] == "" {
+		return "", true, fmt.Errorf("unexpected ECR authorization token format for %s", host)
+	}
+
+	authHeader, err := utilsregistry.EncodeAuthHeader(parts[0], parts[1], host)
+	if err != nil {
+		return "", true, fmt.Errorf("encode ECR authorization for %s: %w", host, err)
+	}
+	return authHeader, true, nil
 }
 
 // GetOrRefreshECRToken returns a valid ECR auth token (username + password) for the given

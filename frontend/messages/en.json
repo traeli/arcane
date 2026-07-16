@@ -3547,11 +3547,22 @@
 	"compose_image_source_label": "Image source",
 	"compose_image_registry_label": "Registry",
 	"compose_image_registry_placeholder": "Select a registry",
+	"compose_image_repository_label": "Repository",
+	"compose_image_repository_placeholder": "Select a repository",
+	"compose_image_tag_label": "Tag",
+	"compose_image_tag_placeholder": "Select a tag",
 	"compose_image_target_service": "Apply to service",
 	"compose_image_create_service": "Create a new service",
 	"compose_image_service_name": "Service name",
 	"compose_image_apply": "Apply to configuration",
 	"compose_image_selection_required": "Select an image and service first.",
 	"compose_image_applied": "Image applied to service {service}.",
-	"compose_image_invalid_yaml": "Fix the Compose YAML errors before applying an image."
+	"compose_image_invalid_yaml": "Fix the Compose YAML errors before applying an image.",
+	"project_service_image_change": "Change service image",
+	"project_service_image_change_description": "Select an image for {service}. Arcane pulls it before changing the Compose file or recreating the service.",
+	"project_service_image_current": "Current image: {image}",
+	"project_service_image_pull_and_update": "Pull and update",
+	"project_service_image_update_started": "Image pull and service update started.",
+	"project_service_image_update_failed": "Failed to start the service image update.",
+	"project_service_image_updating": "Updating image"
 }
