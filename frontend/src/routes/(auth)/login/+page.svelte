@@ -8,7 +8,6 @@
 	import { m } from '$lib/paraglide/messages';
 	import { authService } from '$lib/services/auth-service';
 	import { queryKeys } from '$lib/query/query-keys';
-	import { getApplicationLogo } from '$lib/utils/docker';
 	import { ArcaneButton } from '$lib/components/arcane-button/index.js';
 	import { onMount } from 'svelte';
 	import { createMutation, useQueryClient } from '@tanstack/svelte-query';
@@ -26,9 +25,6 @@
 	// when animations are disabled. (OS reduced-motion is handled by the
 	// prefers-reduced-motion rule in the <style> below.)
 	const showAmbientMotion = $derived(data.settings?.animationsEnabled !== false);
-
-	const accentColor = $derived(data.settings?.accentColor);
-	const logoUrl = $derived(getApplicationLogo(false, accentColor, accentColor));
 
 	const oidcEnabledBySettings = $derived(data.settings?.oidcEnabled === true);
 	const showOidcLoginButton = $derived(oidcEnabledBySettings);
@@ -100,7 +96,7 @@
 </script>
 
 <svelte:head>
-	<title>{m.layout_title()}</title>
+	<title>{m.brand_login_title()}</title>
 </svelte:head>
 
 <div class="ambient" aria-hidden="true">
@@ -117,13 +113,16 @@
 	<div class="grid min-h-dvh w-full max-w-screen-2xl grid-cols-1 lg:grid-cols-[1.05fr_minmax(420px,0.95fr)]">
 		<aside class="showcase relative hidden flex-col justify-between overflow-hidden p-10 lg:flex xl:p-14">
 			<div class="relative z-[var(--arcane-z-raised)] flex items-center gap-3">
-				<div class="bg-card/40 ring-border/40 inline-flex size-10 items-center justify-center rounded-xl border ring-1">
-					<img class="h-6 w-auto" src={logoUrl} alt="" />
-				</div>
+				<img
+					class="size-12 rounded-xl object-cover shadow-lg shadow-black/20 ring-1 ring-white/10"
+					src="/drh-logo.png"
+					alt={m.brand_name()}
+				/>
 				<div class="flex flex-col leading-tight">
-					<span class="text-foreground/90 text-sm font-medium tracking-wide">{m.layout_title()}</span>
+					<span class="text-foreground text-lg font-semibold tracking-wide">{m.brand_name()}</span>
+					<span class="text-muted-foreground mt-0.5 text-xs tracking-[0.2em]">{m.brand_deployment_platform()}</span>
 					{#if data.versionInformation?.displayVersion}
-						<span class="text-muted-foreground/60 font-mono text-[10px] tracking-wider"
+						<span class="text-muted-foreground/50 mt-1 font-mono text-[10px] tracking-wider"
 							>{data.versionInformation.displayVersion}</span
 						>
 					{/if}
@@ -131,13 +130,16 @@
 			</div>
 
 			<div class="relative z-[var(--arcane-z-raised)] max-w-xl">
-				<h2 class="text-foreground text-5xl leading-[1.05] font-semibold tracking-tight text-balance xl:text-6xl">
-					{m.auth_tagline_line1()}
+				<h2 class="text-foreground text-6xl leading-[0.95] font-semibold tracking-tight text-balance xl:text-7xl">
 					<span
-						class="to-foreground/70 bg-gradient-to-br from-[var(--primary)] via-[var(--primary)] bg-clip-text text-transparent"
-						>{m.auth_tagline_line2()}</span
+						class="block bg-gradient-to-br from-[var(--primary)] via-[var(--primary)] to-[var(--foreground)] bg-clip-text text-transparent"
+						>{m.brand_name()}</span
 					>
+					<span class="text-foreground/80 mt-3 block text-4xl font-medium tracking-[0.12em] xl:text-5xl">
+						{m.brand_deployment_platform()}
+					</span>
 				</h2>
+				<p class="text-muted-foreground mt-7 max-w-md text-base leading-relaxed">{m.auth_login_subtitle()}</p>
 			</div>
 
 			<div class="relative z-[var(--arcane-z-raised)] h-8"></div>
@@ -146,9 +148,13 @@
 		<section class="form-pane relative flex min-h-dvh flex-col items-center justify-center p-6 sm:p-10 lg:p-10 xl:p-14">
 			<div class="mb-8 flex w-full max-w-md justify-center lg:hidden">
 				<div
-					class="bg-card/80 ring-border/40 flex items-center justify-center rounded-2xl border p-5 shadow-[0_8px_32px_-8px_rgba(0,0,0,0.35)] ring-1"
+					class="bg-card/80 ring-border/40 flex items-center gap-4 rounded-2xl border p-4 pr-6 shadow-[0_8px_32px_-8px_rgba(0,0,0,0.35)] ring-1"
 				>
-					<img class="h-16 w-auto" src={logoUrl} alt={m.layout_title()} />
+					<img class="size-14 rounded-xl object-cover ring-1 ring-white/10" src="/drh-logo.png" alt={m.brand_name()} />
+					<div class="text-left leading-tight">
+						<div class="text-xl font-semibold tracking-wide">{m.brand_name()}</div>
+						<div class="text-muted-foreground mt-1 text-xs tracking-[0.18em]">{m.brand_deployment_platform()}</div>
+					</div>
 				</div>
 			</div>
 
@@ -156,7 +162,7 @@
 				<div class="bg-primary/70 mb-8 h-px w-10 shadow-[0_0_8px_var(--primary)]"></div>
 
 				<div class="mb-8 flex flex-col text-left">
-					<h1 class="text-3xl font-semibold tracking-tight sm:text-[2rem]">{m.auth_welcome_back_title()}</h1>
+					<h1 class="text-3xl font-semibold tracking-tight sm:text-[2rem]">{m.brand_login_title()}</h1>
 					<p class="text-muted-foreground mt-2 text-sm">{m.auth_login_subtitle()}</p>
 				</div>
 
