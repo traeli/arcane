@@ -20,6 +20,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"go.getarcane.app/sys/crypto"
+	"golang.org/x/sync/errgroup"
 )
 
 const ecrTokenTTL = 12 * time.Hour
@@ -34,6 +35,11 @@ func isECRRegistryHostInternal(registryHost string) bool {
 type ecrTokenResult struct {
 	username string
 	password string
+}
+
+type registryTagCreatedAtInternal struct {
+	tag       string
+	createdAt time.Time
 }
 
 // getLocalECRAuthHeaderInternal resolves ECR credentials from the standard AWS
@@ -238,14 +244,40 @@ func (s *ContainerRegistryService) ListRegistryTags(ctx context.Context, registr
 		if listErr != nil {
 			return nil, fmt.Errorf("list registry tags: %w", listErr)
 		}
-		slices.Sort(values)
-		return values, nil
+
+		// The Distribution tags API does not expose timestamps. Read the image
+		// configs concurrently, while keeping the request pressure bounded.
+		tags := make([]registryTagCreatedAtInternal, len(values))
+		var metadataGroup errgroup.Group
+		metadataGroup.SetLimit(8)
+		for i, value := range values {
+			if ctx.Err() != nil {
+				break
+			}
+			tags[i].tag = value
+			metadataGroup.Go(func() error {
+				image, imageErr := remote.Image(repo.Tag(value), remoteOptions...)
+				if imageErr != nil {
+					return nil
+				}
+				configFile, configErr := image.ConfigFile()
+				if configErr == nil {
+					tags[i].createdAt = configFile.Created.Time
+				}
+				return nil
+			})
+		}
+		_ = metadataGroup.Wait()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("list registry tag metadata: %w", ctxErr)
+		}
+		return sortRegistryTagsNewestFirstInternal(tags), nil
 	}
 	client, err := s.ecrClientForRegistryInternal(ctx, reg)
 	if err != nil {
 		return nil, err
 	}
-	var values []string
+	var values []registryTagCreatedAtInternal
 	var token *string
 	for {
 		page, pageErr := client.DescribeImages(ctx, &ecr.DescribeImagesInput{RepositoryName: &repository, NextToken: token})
@@ -253,14 +285,34 @@ func (s *ContainerRegistryService) ListRegistryTags(ctx context.Context, registr
 			return nil, fmt.Errorf("describe ECR images: %w", pageErr)
 		}
 		for _, item := range page.ImageDetails {
-			values = append(values, item.ImageTags...)
+			for _, tag := range item.ImageTags {
+				createdAt := time.Time{}
+				if item.ImagePushedAt != nil {
+					createdAt = *item.ImagePushedAt
+				}
+				values = append(values, registryTagCreatedAtInternal{tag: tag, createdAt: createdAt})
+			}
 		}
 		token = page.NextToken
 		if token == nil || *token == "" {
-			slices.Sort(values)
-			return values, nil
+			return sortRegistryTagsNewestFirstInternal(values), nil
 		}
 	}
+}
+
+func sortRegistryTagsNewestFirstInternal(tags []registryTagCreatedAtInternal) []string {
+	slices.SortFunc(tags, func(a, b registryTagCreatedAtInternal) int {
+		if createdAtOrder := b.createdAt.Compare(a.createdAt); createdAtOrder != 0 {
+			return createdAtOrder
+		}
+		return strings.Compare(a.tag, b.tag)
+	})
+
+	values := make([]string, len(tags))
+	for i, tag := range tags {
+		values[i] = tag.tag
+	}
+	return values
 }
 
 func registryNameOptionsInternal(reg *models.ContainerRegistry) []name.Option {

@@ -9,9 +9,16 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/models"
 	"github.com/getarcaneapp/arcane/types/v2/containerregistry"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/registry"
+	"github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	dockerregistry "github.com/moby/moby/api/types/registry"
 	"github.com/moby/moby/client"
 	"github.com/opencontainers/go-digest"
@@ -929,12 +936,15 @@ func TestContainerRegistryService_ListRegistryTags_GenericUsesStoredCredentials(
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		assert.Equal(t, "/v2/team/app/tags/list", r.URL.Path)
 		username, password, ok := r.BasicAuth()
 		assert.True(t, ok)
 		assert.Equal(t, "my-user", username)
 		assert.Equal(t, "my-token", password)
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"name": "team/app", "tags": []string{"v2", "latest"}}))
+		if r.URL.Path == "/v2/team/app/tags/list" {
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"name": "team/app", "tags": []string{"v2", "latest"}}))
+			return
+		}
+		http.NotFound(w, r)
 	}))
 	defer server.Close()
 
@@ -952,6 +962,52 @@ func TestContainerRegistryService_ListRegistryTags_GenericUsesStoredCredentials(
 	tags, err := svc.ListRegistryTags(context.Background(), reg.ID, "team/app")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"latest", "v2"}, tags)
+}
+
+func TestContainerRegistryService_ListRegistryTags_SortsNewestImageFirst(t *testing.T) {
+	_, db := setupImageServiceAuthTest(t)
+
+	server := httptest.NewServer(registry.New())
+	defer server.Close()
+	serverURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	repository, err := name.NewRepository(serverURL.Host+"/team/app", name.Insecure)
+	require.NoError(t, err)
+
+	oldImage, err := mutate.CreatedAt(empty.Image, v1.Time{Time: time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)})
+	require.NoError(t, err)
+	newImage, err := mutate.CreatedAt(empty.Image, v1.Time{Time: time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)})
+	require.NoError(t, err)
+	require.NoError(t, remote.Write(repository.Tag("old"), oldImage))
+	require.NoError(t, remote.Write(repository.Tag("new"), newImage))
+
+	insecure := true
+	svc := NewContainerRegistryService(db, nil, nil)
+	reg, err := svc.CreateRegistry(context.Background(), models.CreateContainerRegistryRequest{
+		URL:             server.URL,
+		Username:        "my-user",
+		Token:           "my-token",
+		Insecure:        &insecure,
+		RepositoryNames: []string{"team/app"},
+	})
+	require.NoError(t, err)
+
+	tags, err := svc.ListRegistryTags(context.Background(), reg.ID, "team/app")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"new", "old"}, tags)
+}
+
+func TestSortRegistryTagsNewestFirstInternal_UsesStableTagFallback(t *testing.T) {
+	createdAt := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	tags := []registryTagCreatedAtInternal{
+		{tag: "unknown-b"},
+		{tag: "same-b", createdAt: createdAt},
+		{tag: "newest", createdAt: createdAt.Add(time.Hour)},
+		{tag: "unknown-a"},
+		{tag: "same-a", createdAt: createdAt},
+	}
+
+	assert.Equal(t, []string{"newest", "same-a", "same-b", "unknown-a", "unknown-b"}, sortRegistryTagsNewestFirstInternal(tags))
 }
 
 func TestContainerRegistryService_CreateRegistry_NormalizesRepositoryNames(t *testing.T) {
